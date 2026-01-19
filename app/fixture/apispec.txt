@@ -1,0 +1,2531 @@
+﻿Payment Nexus API Specification (v1.0.0-Beta)
+This document defines the interface and governing protocols for Nexus, the internal high-throughput payment processing engine. This specification is designed for backend engineers and system integrators. Adherence to the constraints defined herein is mandatory for all internal services interacting with the ledger.
+________________
+
+
+1. Governance and Design Principles
+1.1 Architectural Constraints
+* Idempotency: All POST and PATCH operations MUST support the X-Idempotency-Key header to prevent double-billing and duplicate ledger entries.
+* Statelessness: The API is RESTful; no session state is maintained on the server.
+* Data Residency: All request payloads MUST adhere to regional data residency laws as specified in the X-Nexus-Region header.
+1.2 Standards Compliance
+* ISO 20022: Messaging patterns follow ISO 20022 financial standards for credit transfers and status reports.
+* ISO 4217: All currency codes MUST be three-letter uppercase strings (e.g., "USD", "EUR").
+* ISO 8601: All timestamps MUST be in UTC and formatted as YYYY-MM-DDTHH:mm:ssZ.
+________________
+
+
+2. Versioning Strategy
+Nexus utilizes Semantic Versioning (SemVer) at the API gateway level.
+* Major Versioning (Path-based): Breaking changes (e.g., removing fields, changing data types) result in a new path prefix: /v1/, /v2/.
+* Minor/Patch Versioning (Header-based): Non-breaking changes (e.g., adding optional fields) are rolled out under the same path. Integrators may request a specific minor version using the Accept-Version header.
+Rule: Clients MUST be designed to ignore unknown fields in JSON responses to ensure forward compatibility with minor version updates.
+________________
+
+
+3. Security and Authentication
+Nexus is a Tier-0 security-sensitive system. All communication requires Mutual TLS (mTLS) and token-based authorization.
+3.1 Authentication Mechanism
+The system utilizes OAuth 2.0 Client Credentials flow. Services must exchange their vault-stored credentials for a short-lived JWT (JSON Web Token).
+* Header: Authorization: Bearer <JWT>
+* TTL: Tokens expire after 15 minutes.
+* Issuer: https://auth.nexus.internal
+3.2 Scopes and Permissions
+Access is governed by the Principle of Least Privilege (PoLP). Scopes are granular:
+Scope
+	Description
+	payments.write
+	Create and execute new payment instructions.
+	payments.read
+	View transaction history and status.
+	payouts.execute
+	Authorize outbound fund transfers to external banks.
+	admin.refund
+	Issue refunds for processed transactions.
+	3.3 Request Signing
+For operations involving fund movement over $10,000 USD, the X-Nexus-Signature header is REQUIRED. This is a HMAC-SHA256 hash of the request body, signed using the service’s private key.
+________________
+
+
+4. Rate Limiting and Quotas
+To protect ledger integrity, Nexus enforces tiered rate limits based on the calling service's priority.
+4.1 Global Limits
+* Tier 1 (Critical Path): 5,000 requests per second (RPS).
+* Tier 2 (Internal Reporting): 500 RPS.
+* Tier 3 (Ad-hoc): 50 RPS.
+4.2 Response Headers
+When a limit is reached, the API returns a 429 Too Many Requests status. Every response includes:
+* X-RateLimit-Limit: Maximum requests allowed in the window.
+* X-RateLimit-Remaining: Requests remaining in the current window.
+* X-RateLimit-Reset: Seconds remaining until the window resets.
+________________
+
+
+5. Error Handling Conventions
+Nexus uses standard HTTP status codes supplemented by a machine-readable internal error object.
+5.1 Error Response Schema
+JSON
+{
+  "error": {
+    "code": "INSUFFICIENT_FUNDS",
+    "message": "The source account does not have enough balance for this transaction.",
+    "request_id": "req_8823_af92",
+    "details": [
+      {
+        "field": "amount.value",
+        "issue": "Requested: 500.00; Available: 120.50"
+      }
+    ]
+  }
+}
+
+
+5.2 Common Status Codes
+* 400 Bad Request: Payload validation failed.
+* 401 Unauthorized: Missing or invalid JWT.
+* 403 Forbidden: Valid token, but insufficient scope for this resource.
+* 409 Conflict: Idempotency key reuse with different parameters or resource state conflict.
+* 422 Unprocessable Entity: Syntactically correct but semantically invalid (e.g., business logic violation).
+________________
+
+
+6. Global Schema Definitions
+These schemas are reused across all endpoints.
+6.1 Money Object
+Represents a monetary amount.
+JSON
+{
+  "currency": "USD",
+  "value": "1250.00",
+  "precision": 2
+}
+
+
+* value MUST be a string to avoid floating-point errors.
+* precision denotes the number of decimal places for the currency.
+6.2 Party Object
+Represents an entity (Individual or Business) in a transaction.
+JSON
+{
+  "id": "acc_01H2J",
+  "type": "INDIVIDUAL",
+  "name": "Jane Doe",
+  "country_code": "US"
+}
+
+
+________________
+
+
+7. Endpoint Specifications: Payments
+The following endpoints manage the lifecycle of a payment intent.
+7.1 Create Payment Intent
+POST /v1/payments
+Initiates a new payment process. This reserves the funds but does not finalize the ledger entry until the capture step (if using two-phase commit).
+Request Parameters:
+| Name | Type | Location | Required | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| X-Idempotency-Key | String | Header | Yes | Unique client-generated key. |
+| amount | Object | Body | Yes | See 6.1 Money Object. |
+| source | Object | Body | Yes | The origin of funds. |
+| destination | Object | Body | Yes | The recipient of funds. |
+| capture_method | String | Body | No | AUTOMATIC or MANUAL. Defaults to AUTOMATIC. |
+Request Example:
+JSON
+{
+  "amount": {
+    "currency": "USD",
+    "value": "45.00",
+    "precision": 2
+  },
+  "source": {
+    "id": "src_9921",
+    "type": "WALLET"
+  },
+  "destination": {
+    "id": "dest_4432",
+    "type": "MERCHANT_ACCOUNT"
+  },
+  "capture_method": "MANUAL",
+  "metadata": {
+    "order_id": "ORD-771"
+  }
+}
+
+
+Response (201 Created):
+JSON
+{
+  "id": "pay_550e8400",
+  "status": "REQUIRES_CAPTURE",
+  "amount": {
+    "currency": "USD",
+    "value": "45.00"
+  },
+  "created_at": "2026-01-19T10:00:00Z",
+  "expires_at": "2026-01-20T10:00:00Z"
+}
+
+
+________________
+
+
+7.2 Capture Payment
+POST /v1/payments/{payment_id}/capture
+Finalizes a payment that was created with capture_method: MANUAL.
+Constraints:
+* MUST NOT capture an amount greater than the authorized intent.
+* MUST be called within the expires_at window provided in the creation response.
+Request Example:
+JSON
+{
+  "amount_to_capture": {
+    "currency": "USD",
+    "value": "45.00"
+  }
+}
+
+
+Response (200 OK):
+JSON
+{
+  "id": "pay_550e8400",
+  "status": "SUCCEEDED",
+  "settled_at": "2026-01-19T10:05:00Z"
+}
+
+
+________________
+
+
+7.3 Refund Payment
+POST /v1/payments/{payment_id}/refunds
+Initiates a full or partial refund for a succeeded payment.
+Request Parameters:
+* amount: (Optional) If omitted, a full refund is processed.
+* reason: (String) Required for audit trails. One of: DUPLICATE, FRAUDULENT, CUSTOMER_REQUEST.
+Response (202 Accepted):
+Refunding is an asynchronous process involving downstream banking rails.
+JSON
+{
+  "refund_id": "ref_ac882",
+  "payment_id": "pay_550e8400",
+  "status": "PENDING"
+}
+
+
+________________
+
+
+7.4 Retrieve Payment Details
+GET /v1/payments/{payment_id}
+Fetches the current state of a payment.
+Query Parameters:
+* expand: (String) Comma-separated list of fields to expand (e.g., expand=source,destination).
+Response (200 OK):
+JSON
+{
+  "id": "pay_550e8400",
+  "status": "SUCCEEDED",
+  "amount": { "currency": "USD", "value": "45.00" },
+  "source": { "id": "src_9921" },
+  "timeline": [
+    { "status": "CREATED", "time": "2026-01-19T10:00:00Z" },
+    { "status": "SUCCEEDED", "time": "2026-01-19T10:05:00Z" }
+  ]
+}
+
+
+________________
+
+
+7.5 List Payment History
+GET /v1/payments
+Returns a paginated list of payments associated with the caller's authorized scope.
+Pagination Strategy:
+Nexus uses Cursor-based Pagination. Offset-based pagination is PROHIBITED due to performance degradation on large datasets and potential for missed items during record insertion.
+Query Parameters:
+* limit: (Integer) Max number of records. Default: 20, Max: 100.
+* starting_after: (String) A cursor for use in pagination.
+* status: (String) Filter by status (e.g., PENDING, FAILED).
+Response Example:
+JSON
+{
+  "object": "list",
+  "data": [...],
+  "has_more": true,
+  "next_cursor": "pay_99201_xyz"
+}
+
+
+
+
+________________
+
+
+8. Pagination and Filtering Logic
+To ensure system stability and low latency, Nexus enforces strict data retrieval patterns for all collection endpoints (e.g., /v1/payments, /v1/payouts, /v1/webhooks).
+8.1 Cursor-Based Pagination
+As noted in Section 7.5, Nexus exclusively uses cursor-based pagination. Traditional LIMIT/OFFSET patterns are NOT SUPPORTED because they require the database to scan and discard OFFSET rows, leading to $O(n)$ performance degradation.
+* The Cursor: The next_cursor returned in the response represents the unique identifier of the last object in the current page.
+* The Direction: By default, results are returned in reverse-chronological order (created_at DESC).
+* The Request: To fetch the next page, provide the next_cursor value in the starting_after query parameter.
+8.2 Filtering Parameters
+Filtering is limited to indexed fields to prevent unoptimized table scans.
+* Date Ranges: Use created_at[gte] (Greater than or equal) and created_at[lte] (Less than or equal) using ISO 8601 strings.
+* Exact Matches: Fields like status, currency, and source_id support exact string matching.
+* Logical Operators: Complex logical operators (OR, NOT) are not supported at the API level. Integrators needing complex querying should ingest data into their own local read-models.
+________________
+
+
+9. Webhooks and Event-Driven Architecture
+Since many payment operations (e.g., ACH transfers, cross-border wires) are asynchronous, Nexus utilizes webhooks to notify consuming services of state changes.
+9.1 The Event Object
+All webhooks deliver a standardized Event wrapper.
+JSON
+{
+  "id": "evt_29201",
+  "type": "payment.succeeded",
+  "created_at": "2026-01-19T10:05:01Z",
+  "api_version": "1.0.0",
+  "data": {
+    "object": {
+      "id": "pay_550e8400",
+      "status": "SUCCEEDED",
+      "amount": { "currency": "USD", "value": "45.00" }
+    }
+  },
+  "request": {
+    "id": "req_8823_af92",
+    "idempotency_key": "unique-key-123"
+  }
+}
+
+
+9.2 Registration and Endpoints
+POST /v1/webhook_endpoints
+Integrators must register a publicly (internally) accessible URL to receive events.
+Request Body Constraints:
+* url: MUST use HTTPS.
+* enabled_events: An array of event types (e.g., ["payment.succeeded", "payment.failed"]). Using ["*"] is permitted but discouraged for high-volume integrators.
+9.3 Security: Webhook Signing
+To prevent "Man-in-the-Middle" or spoofing attacks, Nexus signs the webhook payload.
+1. Nexus generates a webhook_secret upon endpoint registration.
+2. Each delivery includes a X-Nexus-Signature header.
+3. The header contains a timestamp (t=) and a signature (v1=).
+Validation Requirement:
+Integrators MUST verify the HMAC-SHA256 signature before processing the event. The signature is computed by concatenating the timestamp, a period ., and the JSON string of the request body.
+________________
+
+
+10. Idempotency Implementation
+Idempotency is the cornerstone of Nexus’s "Exactly-Once" processing guarantee. It ensures that if a network interruption occurs, the client can safely retry the request without unintended side effects.
+10.1 Key Lifecycle and Storage
+* Key Uniqueness: Idempotency keys (X-Idempotency-Key) are scoped to the client_id and the specific endpoint.
+* TTL: Nexus stores idempotency keys and their corresponding responses for 24 hours. Retrying with the same key after 24 hours will be treated as a new, distinct request.
+* State Locking: If a second request arrives while the first is still processing, Nexus returns a 409 Conflict with the error code PROCESSING_IN_PROGRESS.
+10.2 Strict Payload Validation
+If a request is retried with the same X-Idempotency-Key but different body parameters, Nexus will return a 400 Bad Request with the error code IDEMPOTENCY_PARAMETER_MISMATCH.
+Rule: You MUST NOT reuse an idempotency key for different transaction intents.
+________________
+
+
+11. Retries and Timeout Semantics
+Integrators must implement robust retry logic to handle transient failures (network blips, 5xx errors, 429 rate limits).
+11.1 Client-Side Retries
+* Exponential Backoff: Retries MUST use an exponential backoff strategy (e.g., $wait = 2^n + \text{jitter}$ seconds).
+* Maximum Retries: It is recommended to cap retries at 5 attempts over a total span of 30 seconds.
+* Safe-to-Retry Codes: * 429 Too Many Requests
+   * 500 Internal Server Error
+   * 502 Bad Gateway
+   * 503 Service Unavailable
+   * 504 Gateway Timeout
+11.2 Server-Side Timeouts
+* Connection Timeout: 5 seconds.
+* Read Timeout: 30 seconds (except for complex reporting queries, which may extend to 60 seconds).
+* Execution Timeout: If a payment rail does not respond within the allocated window, Nexus will transition the payment to a PENDING state and return a 202 Accepted. Clients MUST then poll the status or wait for a webhook.
+________________
+
+
+12. Deprecation and Sunset Policy
+To maintain agility while supporting legacy systems, Nexus follows a formal deprecation schedule.
+12.1 Notification Period
+* Minor Deprecations: (e.g., field deprecation) 3 months notice.
+* Major Version Sunset: (e.g., /v1/ to /v2/) 12 months notice.
+12.2 Signaling Mechanism
+When an endpoint or field is deprecated:
+1. Warning Header: Every response will include a Warning: 299 - "This version is deprecated. See https://docs.nexus.internal/sunset-v1" header.
+2. Deprecation Header: The Deprecation HTTP header will include the date of scheduled sunset.
+3. Brownouts: In the final 30 days before sunset, Nexus will perform "brownouts"—intentionally failing 5% of requests for 1 hour per day to identify un-migrated services.
+________________
+
+
+13. Additional Service Domains: Payouts
+While Payments (Section 7) deal with money coming into the ecosystem or between internal accounts, Payouts handle the movement of funds to external bank accounts.
+13.1 Create Payout
+POST /v1/payouts
+Request Body:
+JSON
+{
+  "amount": {
+    "currency": "USD",
+    "value": "1000.00"
+  },
+  "destination": {
+    "type": "BANK_ACCOUNT",
+    "bank_name": "Chase",
+    "account_number": "******4455",
+    "routing_number": "123456789"
+  },
+  "metadata": {
+    "payroll_id": "PR-990"
+  }
+}
+
+
+Constraints:
+* KYC Compliance: The destination bank account MUST be pre-verified via the /v1/verification service.
+* Balance Check: Nexus MUST verify the source internal ledger has sufficient liquidity before accepting the payout request.
+________________
+
+
+13.2 Cancel Payout
+POST /v1/payouts/{payout_id}/cancel
+Attempts to stop a payout.
+Rule: A payout MUST NOT be cancelled if it has already reached the TRANSMITTED or SUCCEEDED status. Requests to cancel such payouts will result in a 422 Unprocessable Entity.
+________________
+
+
+14. Identity and Verification (KYC/KYB)
+Before funds can be moved to or from external parties, the Party must be verified. This section defines the schemas and endpoints for managing these identities within the Nexus ecosystem.
+14.1 The Identity Schema
+All identities within Nexus are categorized as either INDIVIDUAL or BUSINESS.
+JSON
+{
+  "id": "ident_44921",
+  "type": "BUSINESS",
+  "legal_name": "Acme Corp Industries",
+  "tax_id": "XX-XXXXXXX",
+  "verification_status": "VERIFIED",
+  "address": {
+    "line1": "123 Tech Lane",
+    "city": "San Francisco",
+    "state": "CA",
+    "postal_code": "94105",
+    "country": "US"
+  }
+}
+
+
+14.2 Submit Verification Document
+POST /v1/identities/{identity_id}/documents
+Services MUST upload supporting documentation for high-value participants to comply with Anti-Money Laundering (AML) regulations.
+* Supported Formats: PDF, PNG, JPEG.
+* Size Limit: 10MB.
+* Content: Identity documents (Passport, Driver's License) or Business registration (Articles of Incorporation).
+Response (201 Created):
+JSON
+{
+  "id": "doc_8821",
+  "object": "identity_document",
+  "status": "PENDING_REVIEW",
+  "type": "GOVERNMENT_ID"
+}
+
+
+________________
+
+
+15. Ledger and Accounting Integrity
+Nexus maintains a double-entry bookkeeping system. Every payment or payout corresponds to a set of ledger entries to ensure the total system balance remains zero (sum of debits and credits).
+15.1 Ledger Entry Rules
+1. Atomicity: All entries associated with a single transaction MUST be committed within a single database transaction.
+2. Immutability: Once a ledger entry is written, it MUST NOT be modified or deleted. Any corrections MUST be made through a "Reversing Entry."
+3. Precision: All calculations are performed using $10^{-6}$ precision internally to prevent rounding errors across multiple currency conversions.
+15.2 Retrieve Account Balance
+GET /v1/accounts/{account_id}/balance
+Returns the current available and pending balances for an internal ledger account.
+Response (200 OK):
+JSON
+{
+  "account_id": "acc_01H2J",
+  "balances": [
+    {
+      "currency": "USD",
+      "available": "50440.00",
+      "pending": "1200.00"
+    }
+  ]
+}
+
+
+________________
+
+
+16. Reliability and Disaster Recovery
+16.1 Data Persistence and Replication
+Nexus utilizes a multi-region, distributed SQL database (Spanner) to ensure high availability and strong consistency.
+* RPO (Recovery Point Objective): 0 seconds (zero data loss).
+* RTO (Recovery Time Objective): < 30 seconds for regional failover.
+16.2 The "Safe-to-Retry" Signal
+In the event of a 5xx error, Nexus includes the X-Nexus-Retryable header.
+* If true: The failure is transient. The client should retry using the idempotency key.
+* If false: The failure is deterministic. Retrying without modification will yield the same result.
+________________
+
+
+17. API Audit Logging
+Every request to Nexus is logged in a tamper-evident audit trail for regulatory compliance and security forensics.
+17.1 Required Audit Context
+When making requests, client services are encouraged to provide the X-Nexus-Audit-Context header, containing a JSON-encoded string of the originating user’s metadata.
+Fields:
+* origin_user_id: The ID of the employee or customer who triggered the action.
+* origin_ip: The IP address of the end-user.
+* origin_user_agent: The browser or app version of the end-user.
+Rule: For operations exceeding $50,000, the X-Nexus-Audit-Context is MANDATORY. Failure to provide it will result in a 403 Forbidden.
+________________
+
+
+18. Reconciliation Services
+Integrators must reconcile their local records with the Nexus ledger at least once every 24 hours.
+18.1 Generating Reconciliation Reports
+POST /v1/reports/reconciliation
+Triggers the generation of a CSV or Parquet file containing all transactions for a specific time window.
+Request Parameters:
+JSON
+{
+  "start_time": "2026-01-18T00:00:00Z",
+  "end_time": "2026-01-18T23:59:59Z",
+  "format": "CSV"
+}
+
+
+Workflow:
+1. Client requests report.
+2. Nexus returns a 202 Accepted with a report_job_id.
+3. Upon completion, Nexus sends a report.created webhook.
+4. Client downloads the report from the provided signed URL.
+________________
+
+
+19. Currency Exchange and FX Services
+Nexus provides an internal Foreign Exchange (FX) service to handle cross-border payments where the source account currency differs from the destination currency.
+19.1 FX Rate Discovery
+GET /v1/fx/rates
+Retrieves the current mid-market exchange rates or a guaranteed quote for a specific currency pair.
+Query Parameters:
+* base_currency: The currency to convert from (e.g., USD).
+* target_currency: The currency to convert to (e.g., GBP).
+* amount: (Optional) The volume to be exchanged to calculate volume-based spreads.
+Response (200 OK):
+JSON
+{
+  "pair": "USD_GBP",
+  "rate": "0.784210",
+  "scaling_factor": 6,
+  "expires_at": "2026-01-19T11:00:00Z",
+  "quote_id": "quo_ee992"
+}
+
+
+19.2 Using Quotes in Payments
+To lock in an exchange rate and avoid slippage during a payment, the quote_id MUST be passed in the POST /v1/payments body.
+Constraint: If the quote_id has expired, the payment request will fail with a 422 Unprocessable Entity and the error code FX_QUOTE_EXPIRED.
+________________
+
+
+20. Advanced Idempotency: The Fingerprint Rule
+To prevent subtle "man-in-the-middle" logic errors or client-side bugs where a key is reused for a different payload, Nexus implements Payload Fingerprinting.
+20.1 Semantic Hashing
+When a request arrives with an X-Idempotency-Key, Nexus generates a SHA-256 hash of the "stable" fields in the JSON body (excluding whitespace and metadata).
+* Verification: If the key exists in the database but the fingerprint does not match the previous request, the system assumes a collision or an attempt to change the transaction intent.
+* Response: Nexus returns 409 Conflict with a detailed fingerprint_mismatch error.
+________________
+
+
+21. Reliability: Circuit Breakers and Bulkheads
+To prevent a failure in a downstream banking rail from cascading through the internal microservices, Nexus employs the Circuit Breaker pattern.
+21.1 State Transitions
+* Closed: Normal operation. Requests flow to the bank.
+* Open: After a 5% error threshold (e.g., timeouts or 503s) is reached over a 60-second window, the circuit "opens." Nexus will immediately fail subsequent requests for that specific rail with a 503 Service Unavailable without attempting the downstream call.
+* Half-Open: After a 5-minute cooldown, Nexus allows a limited number of "probe" requests to see if the downstream service has recovered.
+21.2 Bulkheading
+Nexus isolates traffic by Region and Payment Type. A failure in the "ACH-US" rail MUST NOT impact the performance or availability of the "SEPA-EU" rail.
+________________
+
+
+22. Regulatory Reporting (STR/SAR)
+As a security-sensitive system, Nexus is integrated with the Financial Intelligence Unit (FIU) for automated Suspicious Transaction Reporting (STR).
+22.1 Flagging Transactions
+POST /v1/compliance/flags
+Internal risk-scoring services use this endpoint to flag transactions that meet suspicious criteria (e.g., rapid-fire small transfers, high-risk jurisdictions).
+Requirements:
+* Immediate Freeze: If a transaction is flagged with severity: CRITICAL, Nexus will transition the payment to BLOCKED and trigger a manual compliance review.
+* No "Tipping Off": Responses for flagged payments MUST NOT explicitly state that the payment was blocked for compliance reasons to the end-user. The API will return a generic TRANSACTION_UNDER_REVIEW status.
+________________
+
+
+23. Maintenance and Service Windows
+23.1 Planned Maintenance
+Nexus is a 24/7/365 system. Routine maintenance is performed using Blue-Green Deployments.
+* Traffic is shifted at the load balancer level.
+* Active transactions are allowed to "drain" for 60 seconds before the old environment is decommissioned.
+23.2 Emergency Freeze
+In the event of a detected zero-day vulnerability or massive ledger inconsistency, the "Emergency Stop" protocol is triggered.
+* Effect: All WRITE operations return 503 with system_status: EMERGENCY_FREEZE.
+* Read Access: GET operations remain available for reconciliation and audit purposes.
+________________
+
+
+24. Final Constraints and System Rules
+24.1 Implementation MUSTS
+* Integrators MUST log the X-Nexus-Request-ID from every response to facilitate cross-service tracing.
+* Integrators MUST use a library that supports TLS 1.3 for all connections.
+24.2 Implementation MUST NOTS
+* Clients MUST NOT store raw JWTs in unencrypted local logs.
+* Clients MUST NOT attempt to "guess" or increment payment_id values, as they are non-sequential UUIDs.
+________________
+
+
+25. Testing and Sandbox Environment
+To ensure the stability of the production ledger, all integrations MUST be validated in the Nexus Sandbox environment before being granted production credentials.
+25.1 Sandbox Isolation
+The Sandbox (https://api-sandbox.nexus.internal) is a complete functional mirror of the production environment but operates on a physically separate database and mock banking rails.
+* Data Persistence: Sandbox data is volatile and may be purged every 30 days.
+* Simulated Failures: The Sandbox supports "Trigger Headers" to simulate edge cases:
+   * X-Nexus-Simulate-Error: INSUFFICIENT_FUNDS
+   * X-Nexus-Simulate-Timeout: true
+25.2 Magic Values for Testing
+When using the Sandbox, specific values in the request body trigger deterministic responses from the mock bank rails.
+Field
+	Value
+	Resulting Status
+	amount.value
+	0.01
+	DECLINED_BY_BANK
+	amount.value
+	422.00
+	VALIDATION_ERROR
+	destination.id
+	acc_frozen_99
+	ACCOUNT_FROZEN
+	________________
+
+
+26. Advanced Metadata and Custom Fields
+Nexus allows integrators to attach arbitrary key-value pairs to most primary resources (Payments, Payouts, Identities) to facilitate cross-system indexing.
+26.1 Metadata Constraints
+* Limit: Maximum of 20 keys per object.
+* Key Length: Maximum 40 characters.
+* Value Length: Maximum 500 characters.
+* Types: Only strings are supported for values.
+26.2 Searchability
+Metadata is not indexed for high-performance searching in the main API. If you need to filter payments by a custom order_id stored in metadata, you MUST use the asynchronous Reporting API (Section 18) or maintain a secondary index in your local service database.
+________________
+
+
+27. Security: Data Masking and PII
+As a Tier-0 system, Nexus enforces strict Personal Identifiable Information (PII) handling to comply with GDPR and CCPA.
+27.1 Masking Rules in Responses
+Sensitive fields are masked by default in API responses unless the caller has the pii.read scope.
+* Bank Account Numbers: Only the last 4 digits are visible (********4455).
+* Tax IDs: Fully redacted or showing only the suffix.
+27.2 Encryption at Rest
+All PII fields defined in the Identity Schema (Section 14.1) are encrypted using AES-256-GCM before being persisted. The encryption keys are rotated every 90 days via the internal Key Management Service (KMS).
+________________
+
+
+28. Lifecycle of a Payment: State Machine
+Understanding the state transitions is critical for correct integration. A payment moves through a directed acyclic graph (DAG) of statuses.
+28.1 Status Definitions
+* PENDING: Initial state; awaiting internal risk screening.
+* REQUIRES_CAPTURE: Funds authorized/reserved but not moved.
+* PROCESSING: Instruction sent to the downstream clearing house.
+* SUCCEEDED: Funds successfully settled on the ledger.
+* FAILED: Terminal state; funds were not moved.
+* CANCELED: User-initiated termination before processing.
+28.2 Valid Transitions
+Any attempt to transition a payment into an invalid state (e.g., SUCCEEDED -> CANCELED) will return a 422 Unprocessable Entity.
+________________
+
+
+29. Service Level Objectives (SLOs)
+Integrators should design their systems based on the following performance targets:
+* Availability: 99.99% per month.
+* Latency (p95): < 200ms for GET requests; < 500ms for POST (excluding downstream bank latency).
+* Throughput: Supported up to 10,000 requests per second (RPS) per region.
+________________
+
+
+30. Operational Readiness Review (ORR)
+Before moving to production, all consuming services must complete an ORR with the Nexus Platform Team.
+30.1 Checklist Requirements
+1. Idempotency: Verification that all mutation calls use unique keys.
+2. Retries: Verification that exponential backoff is implemented.
+3. Dead Letter Queues (DLQ): Verification that webhook processing failures are captured and retried.
+4. Monitoring: Dashboard showing Nexus error rates and latency.
+________________
+
+
+31. Asset Management and Ledger Sub-Accounts
+To facilitate complex fund flows (such as marketplaces, escrow, or multi-merchant platforms), Nexus supports the creation of virtual sub-accounts under a primary service identity.
+31.1 Sub-Account Hierarchy
+Every service starts with a ROOT account. Sub-accounts can be created to partition funds for specific business units or end-users.
+* Account Type: LIQUIDITY: Used for immediate payouts and operational expenses.
+* Account Type: RESERVE: Funds held for risk mitigation or chargeback coverage; cannot be used for payouts.
+* Account Type: ESCROW: Funds held on behalf of third parties until specific conditions are met.
+31.2 Create Sub-Account
+POST /v1/accounts
+Request Example:
+JSON
+{
+  "parent_account_id": "acc_root_01",
+  "name": "Vendor_Escrow_Bucket_44",
+  "type": "ESCROW",
+  "currency": "USD"
+}
+
+
+Constraints:
+* Sub-accounts MUST inherit the base currency of the parent account unless an FX-enabled cross-currency flag is explicitly authorized.
+* The maximum nesting depth for account hierarchies is 3 levels.
+________________
+
+
+32. Internal Fund Transfers (Journal Entries)
+Internal transfers allow moving money between sub-accounts within the Nexus ledger without touching external banking rails. These are processed instantly.
+32.1 Create Transfer
+POST /v1/transfers
+Request Parameters:
+| Name | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| source_account_id | String | Yes | The ID of the account to debit. |
+| destination_account_id | String | Yes | The ID of the account to credit. |
+| amount | Object | Yes | Value and currency (See Section 6.1). |
+| description | String | Yes | Audit-ready string for ledger logs. |
+Response (201 Created):
+JSON
+{
+  "id": "tr_99012",
+  "status": "COMPLETED",
+  "source_account_id": "acc_root_01",
+  "destination_account_id": "acc_escrow_44",
+  "amount": { "currency": "USD", "value": "150.00" },
+  "ledger_timestamp": "2026-01-19T11:05:00Z"
+}
+
+
+________________
+
+
+33. Compliance: Transaction Monitoring and Sanctions Screening
+Every transaction passing through Nexus is subject to real-time screening against global watchlists (e.g., OFAC, UN, EU).
+33.1 Screening Workflow
+1. Initial Hit: If a source or destination party triggers a potential match, the payment status is set to PENDING_COMPLIANCE.
+2. Asynchronous Review: Compliance officers (or high-confidence AI models) review the hit.
+3. Resolution: The payment is either RELEASED (proceeds to PROCESSING) or REJECTED.
+33.2 Webhook Notification: compliance.review_required
+Integrators should listen for this event to provide feedback to their end-users.
+Warning: To prevent "Tipping Off" violations, the user-facing message MUST NOT mention "Sanctions" or "Watchlists." The recommended phrasing is: "Your transaction is undergoing routine verification and may take up to 24 hours."
+________________
+
+
+34. Batch Processing and Bulk Payments
+For high-volume scenarios like payroll or mass disbursements, Nexus provides a Bulk API to reduce per-request overhead.
+34.1 Batch Submission
+POST /v1/batches/payouts
+Accepts an array of up to 1,000 payout instructions.
+Request Structure:
+JSON
+{
+  "batch_id": "batch_jan_payroll_01",
+  "instructions": [
+    { "amount": {...}, "destination": {...}, "metadata": {...} },
+    { "amount": {...}, "destination": {...}, "metadata": {...} }
+  ]
+}
+
+
+34.2 Execution Logic
+* Validation: The entire batch is validated for schema correctness. If one instruction fails schema validation, the entire batch is rejected (400 Bad Request).
+* Processing: Validated batches are processed as individual transactions. A batch may have "Partial Success," where 990 payouts succeed and 10 fail due to bank-level rejections.
+* Tracking: Clients should poll GET /v1/batches/{batch_id} to receive a summary of statuses.
+________________
+
+
+35. Developer Experience (DX) and Observability
+35.1 Distributed Tracing
+Nexus is compatible with OpenTelemetry.
+* Clients SHOULD propagate the traceparent header (W3C standard).
+* Nexus will inject its internal spans into the provided trace, allowing engineers to visualize the full request lifecycle from the calling microservice through the ledger and out to the bank rail.
+35.2 Client Libraries
+The Nexus team maintains official SDKs for the following languages. Use of these libraries is highly recommended as they include built-in idempotency management and retry logic:
+* Go: nexus-sdk-go
+* Java: nexus-sdk-java (Spring Boot Starter available)
+* Python: nexus-sdk-python (AsyncIO supported)
+________________
+
+
+36. Document Summary and Appendices
+36.1 Glossary of Terms
+* Ledger: The immutable source of truth for all balances.
+* Rail: A connection to an external payment system (e.g., Swift, FedWire, Plaid).
+* Slippage: The difference between the quoted FX rate and the execution rate (minimized by Nexus Quotes).
+* Tier-0: A designation for mission-critical systems that must maintain 99.99%+ availability.
+36.2 Contact and Support
+* Slack: #nexus-dev-support
+* On-call: PagerDuty Nexus-Platform-Primary
+* Documentation: https://wiki.internal.company/nexus
+________________
+
+
+[END OF SPECIFICATION PART 1]
+________________
+
+
+37. Fee Engine and Revenue Attribution
+Nexus incorporates a highly configurable Fee Engine that allows the platform to automatically deduct service fees, interchange costs, or network surcharges during the transaction lifecycle.
+37.1 Fee Schedules
+Fees are calculated based on Fee Schedules linked to a specific service_id or merchant_account. These are applied at the moment of authorization.
+* Flat Fees: A fixed amount per transaction (e.g., $0.25).
+* Percentage Fees: A basis point (BPS) calculation based on the total volume.
+* Tiered Fees: Variable rates that change based on monthly volume thresholds.
+37.2 Fee Deduction Logic
+When a payment is processed, the fee is split into a separate ledger entry.
+Example: A $100.00 Payment with a 2.9% + $0.30 Fee
+1. Source Account: Debited $100.00.
+2. Destination Account: Credited $96.80.
+3. Platform Revenue Account: Credited $3.20.
+37.3 Fee Transparency
+Integrators can preview fees before execution using the POST /v1/payments/preview endpoint. This returns a breakdown of the expected net amount and total fees without creating a ledger intent.
+________________
+
+
+38. Dispute and Chargeback Management
+For card-based payments and certain bank transfers, Nexus provides an interface to manage disputes initiated by the sender’s financial institution.
+38.1 Dispute Statuses
+* NEEDS_RESPONSE: The dispute has been opened; the integrator must provide evidence.
+* UNDER_REVIEW: Evidence has been submitted to the network.
+* WON: The dispute was overturned; funds are returned to the merchant.
+* LOST: The dispute was upheld; funds are permanently debited.
+38.2 Evidence Submission
+POST /v1/disputes/{dispute_id}/evidence
+Integrators must upload documentation (e.g., proof of delivery, service logs) to contest a dispute. Nexus will automatically format and transmit this data to the relevant payment rail.
+Constraint: Evidence MUST be submitted before the evidence_due_by timestamp provided in the dispute object. Late submissions are automatically rejected by the network.
+________________
+
+
+39. Reconciliation and Reporting (Advanced)
+Building upon Section 18, this section covers the programmatic ingestion of financial data for large-scale data warehouses.
+39.1 Streaming Reconciliation (Change Data Capture)
+For services requiring real-time ledger synchronization, Nexus offers a gRPC stream (Nexus Stream).
+* Protocol: gRPC over HTTP/2.
+* Content: An ordered stream of LedgerEntry messages.
+* Guarantees: At-least-once delivery. Clients MUST track the sequence_number to ensure no gaps in the data.
+39.2 Data Warehouse Exports
+Nexus performs a daily ETL (Extract, Transform, Load) to the internal BigQuery/Snowflake instance.
+* Table Schema: nexus_ledger.v1_transactions_partitioned
+* Latency: Data is typically available with T+1 hour latency from the time of settlement.
+________________
+
+
+40. Liquidity Forecasting and Treasury Limits
+To prevent service-level insolvency, Nexus monitors the liquidity of internal "Pool Accounts" used to fund outbound payouts.
+40.1 Threshold Alerts
+When a pool account balance drops below a predefined Critical Minimum, Nexus:
+1. Triggers an alert to the Treasury team.
+2. Returns a WARNING_LOW_LIQUIDITY flag in the metadata of successful payout responses.
+40.2 Hard Limits
+If an account reaches $0.00, the system enters Liquidity Lock for that specific sub-account. All outbound transfers will fail with a 503 error and the code INSUFFICIENT_POOL_LIQUIDITY until a manual top-up (re-funding) occurs from the primary corporate bank.
+________________
+
+
+41. Multi-Entity and Cross-Org Permissions
+In large enterprises, different departments may share the same Nexus cluster but must remain logically isolated.
+41.1 Organization IDs (X-Nexus-Org-ID)
+Every request MUST include an X-Nexus-Org-ID.
+* Nexus uses this header to resolve the correct database shard and encryption context.
+* Security Rule: A JWT issued for Org_A MUST NOT be used to access resources in Org_B. Cross-org access attempts will result in an immediate security audit log and a 403 Forbidden response.
+41.2 Collaborative Access
+Resources can be "shared" between organizations only via an explicit Grant Object. This is common for centralized "Service Centers" that process payments on behalf of multiple subsidiaries.
+________________
+
+
+42. Compliance: Travel Rule and Large Value Transfers
+For cross-border transfers exceeding specific regulatory thresholds (e.g., $3,000 USD for the "Travel Rule"), additional metadata is mandatory.
+42.1 The originator_info Block
+When a transfer is flagged as "High Value Cross-Border," the POST /v1/payouts request MUST include:
+* Full legal address of the sender.
+* Date and place of birth (for individuals).
+* National identification number.
+System Enforcement: Nexus will reject the transaction with 422 Unprocessable Entity if these fields are missing for a jurisdiction-triggered high-value event.
+________________
+
+
+43. API Performance and Payload Optimization
+43.1 Field Filtering (?fields=)
+To reduce network overhead, clients can request a partial response by specifying the fields they require.
+* Example: GET /v1/payments/pay_123?fields=id,status,amount
+* Benefit: Reduces JSON serialization time and payload size by up to 80% for complex objects.
+43.2 Gzip Compression
+Nexus supports Accept-Encoding: gzip. All integrators SHOULD enable gzip compression on their clients to optimize for high-throughput listing operations.
+________________
+
+
+44. Card-Specific Operations: Tokenization and PCI Compliance
+For integrators handling credit and debit card data, Nexus acts as a Level 1 PCI-DSS compliant vault. Direct handling of Raw Primary Account Numbers (PANs) by client services is STRICTLY PROHIBITED unless the service has undergone its own PCI-DSS audit.
+44.1 The Tokenization Flow
+Integrators must use the Nexus Web SDK or Mobile SDK to collect card details. These SDKs transmit the data directly to https://vault.nexus.internal, returning a non-sensitive payment_method_token.
+44.2 Create Payment Method
+POST /v1/payment_methods
+Binds a tokenized card to a specific Identity (Section 14).
+Request Example:
+JSON
+{
+  "identity_id": "ident_44921",
+  "token": "tok_visa_4492_xxy",
+  "set_as_default": true
+}
+
+
+44.3 Card Update (LIFECYCLE)
+Nexus automatically integrates with Card Networks' Account Updater services. When a user's physical card is replaced due to expiration or loss, Nexus updates the vaulted record without requiring developer intervention. A payment_method.updated webhook is emitted upon successful rotation.
+________________
+
+
+45. Advanced Search and Query Engine (GraphQL Overlay)
+While the REST API is optimized for transactional integrity, the Nexus Query Engine provides a GraphQL interface for complex, cross-resource data discovery.
+45.1 Purpose and Scoping
+The GraphQL endpoint is READ-ONLY. It is designed for internal dashboards and customer-facing support tools that need to join data across Payments, Payouts, and Identities in a single round-trip.
+* Endpoint: POST /v1/graphql
+* Schema Discovery: Introspection is enabled only for developers with the admin.read scope.
+45.2 Example Query: Total Volume per Merchant
+GraphQL
+query GetMerchantVolume($merchantId: ID!) {
+  identity(id: $merchantId) {
+    legal_name
+    payments(status: SUCCEEDED, limit: 100) {
+      totalCount
+      edges {
+        node {
+          amount {
+            value
+            currency
+          }
+        }
+      }
+    }
+  }
+}
+
+
+________________
+
+
+46. Idempotency Caveats: Non-Deterministic Results
+While Section 10 outlines the idempotency guarantees, certain scenarios result in "Safe Failures" where the key is consumed but no resource is created.
+46.1 Validation vs. Execution Failures
+* Pre-persistence Failure: If a request fails schema validation (400) before a database record is created, the idempotency key is NOT recorded. The client can fix the payload and retry with the same key.
+* Post-persistence Failure: If a request fails due to business logic (422) after the intent is saved, the key is recorded. Subsequent retries with that key will return the exact same 422 error.
+________________
+
+
+47. Platform Limits: The "Guardrails"
+To maintain Tier-0 availability, the following hard limits are enforced at the API Gateway level.
+Metric
+	Limit
+	Action on Overload
+	Max Request Body Size
+	1 MB
+	413 Payload Too Large
+	Max Batch Size (Payouts)
+	1,000 items
+	400 Bad Request
+	Max Metadata Keys
+	20
+	400 Bad Request
+	Max Concurrent Streams
+	5 per Org
+	429 Too Many Requests
+	Max URI Length
+	2,048 chars
+	414 URI Too Long
+	________________
+
+
+48. Disaster Recovery: The "Break-Glass" Procedure
+In an extreme regional outage, the Nexus Platform Team may activate the Manual Reconciliation Bridge.
+48.1 Offline Transaction Logging
+If the primary API is unreachable for > 15 minutes, critical services are authorized to log "Offline Intents" locally.
+* Once Nexus connectivity is restored, these intents MUST be replayed using the original timestamp and a special X-Nexus-Offline-Sync: true header.
+* Nexus will prioritize these requests to re-align the global ledger.
+________________
+
+
+49. Version Compatibility Matrix
+Nexus Version
+	Status
+	SDK Support
+	Sunset Date
+	v0.9-Alpha
+	Deprecated
+	None
+	2025-12-01
+	v1.0-Beta
+	Active
+	Go, Java, Py
+	N/A
+	v1.1-Preview
+	Experimental
+	Go only
+	N/A
+	________________
+
+
+50. Security: IP Whitelisting (Optional)
+While mTLS and JWT provide robust security, high-risk organizations can request IP Whitelisting (Allowlisting).
+* Requests from non-whitelisted IPs will be rejected with 403 Forbidden even with valid credentials.
+* Update Policy: IP changes require a signed request from the organization’s Security Officer and take 4 hours to propagate.
+________________
+
+
+
+
+The sections above establish the foundational protocols, authentication, core payment/payout objects, and ledger integrity rules. Part 2 of this document will cover specialized modules, including Integrated Tax Reporting, Multi-entity Clearing, and the Nexus Marketplace Settlement Engine.
+________________
+
+
+51. Integrated Tax Reporting (Nexus TaxModule)
+To assist with regulatory compliance, Nexus provides an integrated tax calculation and reporting engine. This module ensures that tax obligations are calculated at the point of transaction rather than at the end of the fiscal period.
+51.1 Tax Object Schema
+When a payment requires tax withholding or collection, a Tax object is appended to the transaction.
+JSON
+{
+  "tax_id": "tx_99210",
+  "type": "VAT",
+  "rate": "0.20",
+  "amount": {
+    "currency": "GBP",
+    "value": "20.00"
+  },
+  "jurisdiction": "GB",
+  "tax_authority_id": "HMRC-001"
+}
+
+
+51.2 Tax Calculation Endpoint
+POST /v1/tax/calculate
+Retrieves the estimated tax for a potential transaction based on the buyer and seller's physical locations.
+Request Body:
+* transaction_amount: The subtotal before tax.
+* origin_address: See Section 14.1 for address structure.
+* destination_address: Required to determine nexus and applicable rates.
+________________
+
+
+52. Multi-Entity Clearing and Settlement
+Nexus supports complex "Nested Settlement" where a payment is cleared across multiple legal entities within a single corporate umbrella.
+52.1 Clearing Accounts
+Clearing accounts act as temporary transit hubs. Funds are moved from an operational entity to a clearing entity before final disbursement.
+* Inter-Company Entries: For every cross-entity transfer, Nexus automatically generates matching "Due To" and "Due From" ledger entries.
+* Consolidation: At 00:00 UTC daily, the Clearing Engine nets all inter-company balances to minimize actual bank wire movements between subsidiaries.
+________________
+
+
+53. Marketplace Settlement Engine
+The Marketplace module is designed for "Platform" business models where a single payment must be split among multiple sub-merchants.
+53.1 Split Payments
+POST /v1/payments (Marketplace Extended)
+Request Example:
+JSON
+{
+  "amount": { "currency": "USD", "value": "100.00" },
+  "splits": [
+    {
+      "destination_id": "merch_sub_01",
+      "amount": { "value": "80.00" },
+      "description": "Product Sale"
+    },
+    {
+      "destination_id": "merch_sub_02",
+      "amount": { "value": "15.00" },
+      "description": "Shipping Provider"
+    }
+  ],
+  "platform_fee": { "value": "5.00" }
+}
+
+
+Rule: The sum of splits + platform_fee MUST exactly equal the root amount.value. If they do not balance, the request is rejected with a 422 error.
+________________
+
+
+54. Advanced Webhook Retry Policies
+Building on Section 9, this section defines the deterministic failure handling for webhook deliveries.
+54.1 Progressive Backoff Schedule
+If an integrator's endpoint returns anything other than a 2xx or 3xx status, Nexus retries the delivery according to the following schedule:
+1. Retry 1: 1 minute after failure.
+2. Retry 2: 5 minutes after failure.
+3. Retry 3: 30 minutes after failure.
+4. Retry 4: 2 hours after failure.
+5. Final Retry (8): 24 hours after failure.
+54.2 Automatic Disablement
+If an endpoint fails consistently for 72 hours, Nexus will mark the webhook subscription as DISABLED. A notification will be sent to the developer's registered email, and a manual "Re-enable" request through the dashboard is required.
+________________
+
+
+55. Cryptographic Nonces and Request Freshness
+To prevent replay attacks on sensitive endpoints, Nexus optionally supports a X-Nexus-Nonce header.
+55.1 Nonce Requirements
+* Uniqueness: A nonce MUST NOT be reused within a 60-minute window for the same client_id.
+* Timestamp Correlation: The nonce must be accompanied by an X-Nexus-Timestamp. If the timestamp is > 300 seconds (5 minutes) off from the Nexus server time, the request is rejected to prevent delayed replays.
+________________
+
+
+56. Resource Metadata Webhooks
+In addition to transaction events, Nexus provides webhooks for metadata changes to assist in cache invalidation.
+* identity.updated: Fired when a legal name or address changes.
+* account.balance_threshold: Fired when an account hits a configured low-balance limit (See Section 40).
+* payment_method.expiring: Fired 30 days before a vaulted card's expiration date.
+________________
+
+
+57. Technical Support Procedures
+57.1 Debugging with Trace IDs
+When contacting support, you MUST provide the X-Nexus-Request-ID. This ID is the unique key used to pull logs from our distributed tracing system (Jaeger).
+57.2 Escalation Matrix
+Priority
+	Definition
+	Response Target
+	P0
+	API totally unreachable or 100% error rate.
+	15 Minutes
+	P1
+	Significant feature impairment (e.g., Payouts failing).
+	1 Hour
+	P2
+	Non-critical bug or Sandbox inconsistency.
+	1 Business Day
+	P3
+	Documentation or SDK clarification.
+	3 Business Days
+	________________
+
+
+58. Final Validation Constraints (Reference Table)
+Attribute
+	Constraint
+	Requirement
+	currency
+	ISO 4217
+	Must be Uppercase
+	idempotency_key
+	UUID or Alphanumeric
+	Max 64 chars
+	metadata_keys
+	Snake_case
+	Max 20 keys
+	amount.value
+	String
+	Must represent Decimal
+	country_code
+	ISO 3116-1 alpha-2
+	2-letter code
+	________________
+
+
+This concludes the foundational and advanced governing rules for the Nexus Payment Platform.
+________________
+
+
+59. High-Availability (HA) Configuration and Regional Sharding
+To support global operations and meet local data sovereignty requirements, Nexus implements a regional sharding architecture. This ensures that payment data is processed and stored within specific geographic boundaries.
+59.1 Regional Endpoints
+Services MUST route requests to the regional endpoint closest to the data residency of the Identity involved.
+Region
+	Primary Endpoint
+	Geographic Scope
+	Americas
+	https://us.api.nexus.internal
+	North & South America
+	Europe
+	https://eu.api.nexus.internal
+	EU, UK, and EEA
+	Asia-Pacific
+	https://apac.api.nexus.internal
+	SE Asia, Australia, Japan
+	59.2 Cross-Region Request Routing
+If a request is sent to the incorrect regional endpoint, Nexus will return a 301 Moved Permanently with the Location header pointing to the correct regional URL. Clients MUST follow redirects and update their local service registry for that specific resource.
+________________
+
+
+60. Compliance: Anti-Money Laundering (AML) Velocity Limits
+In addition to rate limiting for system stability (Section 4), Nexus enforces "Velocity Limits" to prevent rapid fund exfiltration or money laundering patterns.
+60.1 Automated Cooling-Off Periods
+If an Identity exceeds their pre-configured transaction volume or frequency limit, the system enters a "Cool-Off" state.
+* Trigger: e.g., > 10 transactions to new bank accounts within 60 minutes.
+* Action: The API returns 422 Unprocessable Entity with error code VELOCITY_LIMIT_EXCEEDED.
+* Resolution: Limits reset automatically after a rolling 24-hour window or can be manually overridden by a Compliance Officer.
+________________
+
+
+61. Ledger "Soft" vs "Hard" Locks
+The Nexus ledger employs different locking mechanisms to ensure consistency during high-concurrency balance updates.
+61.1 Soft Locks (Pending Transactions)
+Used during the POST /v1/payments phase. Funds are marked as PENDING_DEBIT.
+* Effect: The available_balance decreases, but the ledger_balance remains unchanged.
+* Timeout: If not captured or canceled within 24 hours, the soft lock expires and funds return to available_balance.
+61.2 Hard Locks (Settlement)
+Used during the capture phase.
+* Effect: Both available_balance and ledger_balance are updated atomically. This state is permanent and follows the Immutability rule (Section 15.1).
+________________
+
+
+62. Secure File Uploads and Media Handling
+Certain compliance and dispute workflows require the submission of binary data (e.g., identity documents, proof of delivery).
+62.1 File Tokenization
+POST /v1/files
+To maintain a stateless API, files are uploaded to an ephemeral staging area.
+Request:
+* Content-Type: multipart/form-data
+* purpose: One of DISPUTE_EVIDENCE, IDENTITY_VERIFICATION.
+Response:
+JSON
+{
+  "id": "file_88201_abc",
+  "url": "https://nexus-files.internal/v1/f_88201",
+  "expires_at": "2026-01-19T12:00:00Z"
+}
+
+
+Rule: The resulting file_id MUST be referenced in subsequent API calls (e.g., Section 38.2) within 1 hour, or the file will be purged from the staging area.
+________________
+
+
+63. Operational Observability: Health Checks
+63.1 Deep Health Check
+GET /v1/health/deep
+Returns the health status of the API and its critical downstream dependencies (Database, Vault, Bank Gateway).
+Response (200 OK):
+JSON
+{
+  "status": "UP",
+  "version": "1.0.0-Beta",
+  "dependencies": {
+    "ledger_db": "HEALTHY",
+    "vault_kms": "HEALTHY",
+    "bank_gateway_us": "DEGRADED"
+  }
+}
+
+
+Note: Automated load balancers SHOULD use this endpoint to determine if a specific regional node should be pulled from rotation.
+________________
+
+
+64. API deprecation: Field-Level Sunset
+When a field is deprecated (but the endpoint remains active), Nexus uses the Sunset HTTP header at the field level within the JSON response metadata.
+64.1 Deprecation Metadata
+JSON
+{
+  "_metadata": {
+    "deprecated_fields": {
+      "old_account_num": {
+        "sunset_date": "2026-06-01",
+        "replacement": "account_id"
+      }
+    }
+  },
+  "id": "acc_01",
+  "old_account_num": "12345"
+}
+
+
+________________
+
+
+65. The "Nexus-Trace-ID" and Log Correlation
+For every request, Nexus generates a X-Nexus-Trace-ID.
+* This ID MUST be logged by the client service.
+* It is also injected into the headers of all downstream webhook deliveries.
+* This allows for "Complete Lifecycle Tracing" from the initial POST /v1/payments to the final payment.succeeded webhook.
+
+
+________________
+
+
+66. External Banking Adapters (The Bridge Layer)
+While the core Nexus API provides a unified interface, the Bridge Layer handles the translation between Nexus internal schemas and the fragmented protocols used by global banking networks.
+66.1 Supported Rail Protocols
+Nexus abstracts the following protocols into the unified POST /v1/payouts and POST /v1/payments workflows:
+* ISO 20022 (XML): Used for SEPA (Europe) and modern Real-Time Payment (RTP) networks.
+* NACHA: Fixed-width file formats for US ACH batch processing.
+* SWIFT MT: Legacy messaging for international wire transfers.
+* JSON/REST: Direct host-to-host integrations with modern FinTech banks.
+66.2 Rail-Specific Error Mapping
+When a downstream bank rejects a transaction, the Bridge Layer translates the raw bank error (e.g., an ACH Return Code R01) into a Nexus Standard Error (e.g., INSUFFICIENT_FUNDS).
+Bank Raw Code
+	Rail Type
+	Nexus Standard Code
+	Description
+	R01
+	ACH
+	INSUFFICIENT_FUNDS
+	Available balance too low.
+	AC04
+	SEPA
+	ACCOUNT_CLOSED
+	Creditor account is no longer active.
+	14
+	Card
+	INVALID_NUMBER
+	The card number is incorrect.
+	54
+	Card
+	EXPIRED_CARD
+	The card's expiry date has passed.
+	________________
+
+
+67. Balance Management: Virtual vs. Physical Settlement
+Nexus distinguishes between the Virtual Ledger (Nexus's internal records) and Physical Settlement (actual movement of money between bank accounts).
+67.1 Intra-Day Liquidity
+During business hours, Nexus may allow virtual settlement for trusted accounts before physical funds have arrived from the clearinghouse.
+* Risk Control: The maximum_virtual_exposure limit defines how much a service can transact against "expected" but not yet "cleared" funds.
+* Clawback: If a physical settlement fails (e.g., an ACH reversal), Nexus automatically initiates a Ledger Correction Event to reconcile the virtual balance.
+________________
+
+
+68. Advanced Authentication: Scoped API Keys
+In addition to the OAuth 2.0 flow (Section 3), Nexus supports Scoped API Keys for restricted, non-user-facing automated tasks (e.g., cron jobs for reconciliation).
+68.1 Key Structure
+Keys follow the format: nx_live_[a-zA-Z0-9]{32}.
+* Storage: Keys MUST be stored in an HSM or secret manager (e.g., HashiCorp Vault).
+* Rotation: Keys have a mandatory rotation period of 180 days.
+68.2 Restricted IP Binding
+Every Scoped API Key MUST be bound to a specific CIDR block. A key used from an unauthorized IP will be automatically revoked by the Nexus Intrusion Detection System (IDS).
+________________
+
+
+69. Compliance: The "Sanctions Freeze" Workflow
+When a transaction is flagged by the screening engine (Section 33) and a "Hard Match" is confirmed, Nexus enters a regulatory freeze.
+69.1 Account Sequestration
+1. Funds are moved from the sub-account to a Regulatory Sequestration Account.
+2. The Identity status is updated to FROZEN_BY_COMPLIANCE.
+3. All pending WRITE operations for that Identity will fail with a 403 Forbidden and a non-descript error code ACCOUNT_UNAVAILABLE.
+69.2 Unfreezing
+A freeze can only be lifted via a POST /v1/compliance/override request, which requires Multi-Party Approval (MPA). Two authorized Compliance Officers must sign the override request with their hardware security tokens.
+________________
+
+
+70. System Resilience: Chaos Engineering Constraints
+To ensure Nexus remains Tier-0, the platform undergoes weekly "Chaos Drills" in the production environment (during low-traffic windows).
+70.1 Fault Injection Tolerance
+The API is designed to withstand:
+* Latency Injection: +2000ms added to 1% of requests.
+* Region Isolation: Complete loss of one AWS/GCP region.
+* Database Election: A Spanner leader change mid-transaction.
+70.2 Integrator Responsibility
+Integrators MUST design their services to handle these drills. If an integrator’s service fails during a Nexus chaos drill, it is considered a defect in the integrator's implementation of retry and timeout logic.
+________________
+
+
+71. Notification Service: System Status Webhooks
+Beyond transaction events, Nexus provides a SystemStatus webhook for infrastructure monitoring.
+* system.degraded: Fired when a specific bank rail is experiencing high latency or error rates.
+* system.recovered: Fired when a degraded rail returns to baseline SLOs.
+* maintenance.scheduled: Fired 24 hours before a planned blue-green deployment.
+________________
+
+
+72. Final Schema: The Audit Trail Entry
+Every change to a resource (Payment, Account, Identity) generates an Audit Entry.
+JSON
+{
+  "audit_id": "aud_7721",
+  "resource_id": "pay_550e8400",
+  "actor": {
+    "type": "SERVICE",
+    "id": "svc_checkout_prod"
+  },
+  "changes": [
+    {
+      "field": "status",
+      "old_value": "PENDING",
+      "new_value": "SUCCEEDED"
+    }
+  ],
+  "ip_address": "10.0.4.12",
+  "timestamp": "2026-01-19T11:05:00Z"
+}
+
+
+________________
+
+
+[ALL SECTIONS COMPLETED FOR THE COMPREHENSIVE NEXUS SPECIFICATION]
+This document serves as the master technical contract for the Nexus Internal Payment Platform. All integrating services are expected to maintain parity with this specification to ensure ledger integrity and regulatory compliance.
+
+
+________________
+
+
+73. High-Performance Ledger Locking (The "Hot-Shard" Problem)
+In high-throughput scenarios where thousands of transactions hit a single account simultaneously (e.g., a "Flash Sale" on a single merchant account), the ledger can experience row-level contention.
+73.1 Distributed Counters
+To mitigate "Hot-Shards," Nexus utilizes a distributed counter strategy for account balances.
+* Mechanism: Instead of a single balance row, Nexus maintains $N$ hidden sub-slots for the available_balance.
+* Write Path: A transaction randomly selects a slot to update, reducing lock contention by a factor of $N$.
+* Read Path: A GET /v1/accounts/{id}/balance call performs a parallel sum of all slots to return the aggregate balance.
+73.2 Consistency Trade-offs
+While this ensures high availability for writes, it introduces a "stale read" risk of up to 50ms. Services requiring Strong Global Consistency (e.g., for a total account closure) must use the ?consistency=strong query parameter, which forces a synchronous merge of all slots at the cost of higher latency.
+________________
+
+
+74. Liquidity Pools and Multi-Bank Routing
+Nexus does not rely on a single upstream financial institution. It manages liquidity across a "Pool" of multiple global banks to ensure redundancy.
+74.1 Dynamic Routing Logic
+When a POST /v1/payouts is received, the Nexus Router selects the optimal bank rail based on:
+1. Cost: Which bank offers the lowest fee for this currency/jurisdiction?
+2. Speed: Which rail currently has the lowest latency?
+3. Capacity: Which bank account has enough physical liquidity to cover the transfer?
+74.2 Automatic Rebalancing
+If Bank A has a surplus of USD and Bank B has a deficit, Nexus initiates an internal Treasury Transfer to rebalance the physical accounts. These are invisible to the integrator but reflected in the system-level health/deep reports.
+________________
+
+
+75. Advanced Webhook Security: Key Rotation and Idempotency
+75.1 Secret Rotation
+To maintain security hygiene, webhook_secrets (Section 9.3) SHOULD be rotated every 90 days.
+* Grace Period: During rotation, Nexus signs the payload with both the old and the new secret. The X-Nexus-Signature header will contain two entries: v1=... and v2=....
+* Transition: The client service has 24 hours to update its local secret before the old signature is dropped.
+75.2 Webhook Idempotency
+Integrators MUST treat webhook processing as an idempotent operation.
+* The Rule: Use the event.id (Section 9.1) as a unique key in your database.
+* The Reason: Due to the "At-Least-Once" delivery guarantee, Nexus may send the same event multiple times if it does not receive a timely 200 OK.
+________________
+
+
+76. Data Retention and Archival Policy
+As a regulated entity, Nexus adheres to the 7-Year Retention Rule for all financial records.
+76.1 Cold Storage Migration
+* Active Data (0–12 months): Stored in high-performance SSD-backed Spanner instances. Available via standard GET requests.
+* Archive Data (1–7 years): Moved to "Cold Storage" (BigQuery/GCS). Accessing these records requires the use of the POST /v1/archive/retrieval endpoint, with an SLA of 2–4 hours for data availability.
+76.2 Data Deletion (The "Right to be Forgotten")
+Under GDPR, PII in the Identity object (Section 14.1) can be deleted upon request. However, the ledger entries associated with that identity MUST NOT be deleted, as they are required for financial audits. In these cases, PII is replaced with the string [REDACTED_BY_COMPLIANCE].
+________________
+
+
+77. API Response Compression and Serialization
+77.1 Protobuf Support
+For internal high-bandwidth service-to-service communication, Nexus supports Protocol Buffers (Protobuf) as an alternative to JSON.
+* Header: Content-Type: application/x-protobuf
+* Benefit: Reduces payload size by ~60% and CPU overhead for serialization by ~40%.
+77.2 Binary Floating Point Prohibition
+Nexus NEVER returns monetary values as JSON numbers (floats). They are always strings.
+* Incorrect: "amount": 10.50
+* Correct: "amount": "10.50"
+________________
+
+
+78. Global Maintenance Windows
+While Nexus uses Blue-Green deployments (Section 23.1), a Global Hard Maintenance window is scheduled once per quarter for core database schema migrations that cannot be performed online.
+* Schedule: Second Sunday of the quarter, 02:00–04:00 UTC.
+* Impact: All API writes are disabled; reads may be degraded.
+* Notification: Sent via maintenance.scheduled webhook 7 days in advance.
+________________
+
+
+79. Compliance: Suspicious Activity Monitoring (SAM)
+Nexus runs a suite of machine learning models to detect fraud in real-time.
+79.1 Risk Scoring
+Every PaymentIntent receives a risk_score from 0 to 100.
+* 0–60: Transaction proceeds normally.
+* 61–89: Transaction is flagged for manual review but not blocked.
+* 90–100: Transaction is automatically blocked (402 Payment Required or 403 Forbidden).
+79.2 Challenge-Response (3D Secure)
+For card payments with a high risk score, the API response will include a next_action object.
+JSON
+{
+  "status": "REQUIRES_ACTION",
+  "next_action": {
+    "type": "REDIRECT_TO_URL",
+    "url": "https://bank.com/verify/..."
+  }
+}
+
+
+The integrator MUST redirect the user to complete the 3D Secure challenge before the payment can reach SUCCEEDED.
+________________
+
+
+80. Document Versioning and Change Log
+This document is version-controlled. Significant changes to the specification are logged below.
+Version
+	Date
+	Change Description
+	1.0.0-Beta
+	2026-01-19
+	Initial comprehensive specification release.
+	1.0.1-Beta
+	2026-02-10
+	Added Section 73 (Hot-Shard Mitigation).
+	________________
+
+
+The Nexus Payment Platform Specification Part 1 is now finalized. This document covers all architectural, security, and functional requirements for v1.0.0.
+________________
+
+
+81. Operational Readiness: The "Pre-Flight" Check
+Before any service can transition from the Sandbox (Section 25) to Production, it must undergo an automated Operational Readiness Review (ORR). This ensures the integrator’s architecture is resilient enough to handle the high-concurrency and high-stakes nature of the Nexus ledger.
+81.1 Automated Traffic Simulation
+Nexus provides a performance testing suite that simulates peak-load scenarios for your specific service profile.
+* Success Criteria: Your service MUST handle a burst of 500 requests per second (RPS) with a p99 latency of < 800ms while maintaining zero duplicate transactions (verified via idempotency audit).
+* Failure Simulation: During the test, Nexus will intentionally drop 5% of connections. Your service MUST demonstrate successful exponential backoff and retry without manual intervention.
+________________
+
+
+82. Multi-Region Data Sovereignty and Sharding
+Nexus operates as a globally distributed system, but financial regulations often require data to remain within specific borders (e.g., GDPR in the EU, LGPD in Brazil).
+82.1 Region-Aware Routing
+Integrators MUST utilize the X-Nexus-Region header to specify the residency of the data being processed. If this header is omitted, Nexus defaults to the GLOBAL shard, which may be non-compliant for certain regulated identities.
+Region Code
+	Geographic Boundary
+	Data Residency
+	US-EAST-1
+	United States (East)
+	North America
+	EU-WEST-1
+	European Union
+	Ireland / Frankfurt
+	BR-SA-1
+	Brazil / LATAM
+	São Paulo
+	82.2 Cross-Region Transfers
+When moving funds between identities in different shards (e.g., a US merchant paying a Brazilian vendor), Nexus utilizes a Shadow Account mechanism.
+1. The US Shard debits the sender and credits an "Internal Transit Account."
+2. The BR Shard detects the transit credit and initiates a local credit to the recipient.
+3. This process is atomic but introduces an additional 2–5 seconds of "Propagation Latency."
+________________
+
+
+83. Advanced Cryptography: Mutual TLS (mTLS) 1.3
+For production traffic, standard API keys and JWTs are insufficient. Nexus requires mTLS 1.3 for all transport-level security.
+3.4 (Cont.) mTLS Certificate Requirements
+* Authority: Certificates MUST be issued by the Internal Nexus Root CA.
+* Rotation: Certificates are valid for 90 days. Services MUST support automated ACME-based rotation to prevent expired-cert outages.
+* Revocation: Nexus checks the Online Certificate Status Protocol (OCSP) for every connection. Compromised service instances can be blacklisted globally in < 60 seconds.
+________________
+
+
+84. The "Dry Run" Execution Mode
+To allow integrators to test complex logic (like tax withholding or currency conversion) without affecting ledger balances, all mutation endpoints support a dry_run query parameter.
+84.1 Behavioral Rules
+* POST /v1/payments?dry_run=true: Validates the payload, performs the risk check, calculates fees, and checks for sufficient funds, but DOES NOT create a ledger record.
+* Response: Returns a 200 OK (instead of 201 Created) with the header X-Nexus-Dry-Run: executed.
+________________
+
+
+85. System-Level Health Signals (Downstream Transparency)
+Nexus provides transparency into the health of the various banking "Rails" it connects to. If a major bank (e.g., JP Morgan or Barclays) has an outage, Nexus signals this through the API.
+85.1 Rail Status Header
+Every response includes the X-Nexus-Rail-Status header.
+* Green: All downstream rails operating within SLO.
+* Yellow: One or more rails experiencing latency > 2s.
+* Red: Critical rail failure; certain destination types are currently unavailable.
+________________
+
+
+86. Future-Proofing: The Experimental Features Flag
+Nexus maintains an Experimental version of the API for early-access features. These features are subject to change without the standard 3-month notice (Section 12.1).
+86.1 Opt-in Mechanism
+To access experimental fields or endpoints, the client MUST send the X-Nexus-Beta-Opt-In: <Feature-Name> header.
+Warning: Use of experimental features in production is strictly at the integrator's risk and may be revoked if instability is detected.
+________________
+
+
+87. API Payload Versioning (The "Schema Evolution" Rule)
+To prevent breaking changes when adding fields to large objects, Nexus uses a "Schema Version" in addition to the API path version.
+87.1 Schema Pinning
+Integrators can "pin" their service to a specific schema version in their dashboard.
+* Scenario: If Nexus adds a mandatory tax_id field to the Identity object in v1.2, a service pinned to v1.1 will continue to receive the old schema (with the new field stripped or made optional) until the pin is updated.
+________________
+
+
+88. Technical Debt and Deprecation (Legacy Field Mapping)
+As the API evolves, certain fields are marked as "Legacy" but retained for backward compatibility.
+88.1 The "Translation Layer"
+When a legacy field (e.g., account_number_raw) is used, the Nexus Gateway internally translates it to the new standardized format (payment_method_id).
+* Log Warning: These requests are flagged in the developer dashboard as "Sub-optimal: Using Legacy Mapping."
+* Policy: Legacy mapping is maintained for exactly 2 major versions before being retired.
+________________
+
+
+89. Documentation Glossary (Expanded)
+* ACME: Automated Certificate Management Environment.
+* CIDR: Classless Inter-Domain Routing (used for IP whitelisting).
+* HSM: Hardware Security Module (used for storing private keys).
+* Idempotency Fingerprint: A hash of the request body to ensure key-intent consistency.
+* mTLS: Mutual Transport Layer Security.
+* OCSP: Online Certificate Status Protocol.
+________________
+
+
+90. Final Acknowledgements and Ownership
+The Nexus API is maintained by the Payment Platform Engineering Team.
+* SLA Oversight: Enterprise Infrastructure Group.
+* Security Oversight: Global Cyber-Security Office (GCSO).
+________________
+
+
+The sections above constitute the comprehensive architectural and operational blueprint for the Nexus Internal Payment Platform. All subsequent documents (Part 2, Part 3) will focus on specific regional banking adapters and advanced treasury forecasting modules.
+________________
+
+
+91. Advanced Liquidity Management: The "Sweep" Protocol
+For organizations managing multiple sub-accounts (Section 31), Nexus provides automated liquidity balancing through Sweep Protocols. This ensures that high-velocity payout accounts never hit a "Liquidity Lock" (Section 40.2).
+91.1 Target Balancing
+Integrators can define a Target Balance for specific sub-accounts.
+* The Trigger: Every 60 minutes, Nexus evaluates the account balance.
+* The Action: If the balance exceeds the target, the surplus is "swept" to the ROOT account. If it falls below the Critical Minimum, funds are automatically pulled from the ROOT account.
+91.2 Sweep Constraints
+* Inter-Org Restriction: Sweeps MUST NOT cross Organization IDs (X-Nexus-Org-ID).
+* Audit Trail: Every sweep generates a SystemTransfer ledger entry with the description: AUTO_SWEEP_PROTOCOL_v1.
+________________
+
+
+92. Specialized Asset Classes: Digital Ledgers
+Beyond fiat currencies, Nexus supports a "Units" asset class for internal loyalty points, credits, or commodities.
+92.1 Unit Ledger Objects
+These accounts use a precision of 0 (no decimals) and do not support FX quotes.
+Request Example:
+JSON
+{
+  "amount": {
+    "currency": "LOYALTY_PTS",
+    "value": "500",
+    "precision": 0
+  },
+  "type": "INTERNAL_TRANSFER"
+}
+
+
+________________
+
+
+93. High-Value Payment Interdiction (HVPI)
+Transactions exceeding a specific risk-adjusted threshold (e.g., $1,000,000 USD) are subject to the HVPI protocol.
+93.1 Multi-Sig Authorization
+An HVPI transaction will remain in PENDING_AUTHORIZATION until it is signed by two separate administrative keys.
+* Key A: The calling service's automated key.
+* Key B: A manual "Break-Glass" key held by the Treasury Director.
+________________
+
+
+94. Rate Limit Scoping: The "Fair Use" Policy
+While Tier 1 services have 5,000 RPS (Section 4.1), this is shared across the entire Organization ID.
+94.1 Sub-Service Quotas
+An Organization can partition its global limit among its internal microservices by providing the X-Nexus-Sub-Service header.
+* Example: The Checkout service is granted 4,000 RPS, while the Refunds service is capped at 1,000 RPS.
+* Enforcement: If Checkout hits 4,001 RPS, it receives a 429, even if Refunds is currently at 0 RPS.
+________________
+
+
+95. Debugging: The "Nexus-Console" Utility
+The Nexus team provides a CLI tool, nexus-ctl, for engineers to interact with the API from their development environments (VPN required).
+95.1 Useful Commands
+* nexus-ctl tail --org <id>: Streams real-time webhook events to the terminal.
+* nexus-ctl trace <request_id>: Generates a visual DAG of the transaction’s lifecycle through the internal bank rails.
+* nexus-ctl validate --file <spec.json>: Validates a local JSON payload against the current production schema.
+________________
+
+
+96. Global Data Residency: The "Local-Only" Flag
+For highly sensitive jurisdictions, an identity can be marked as LOCAL_ONLY.
+* Constraint: Data for these identities is NEVER replicated to the GLOBAL shard.
+* Restriction: These identities can only be accessed via the regional endpoint (e.g., eu.api.nexus.internal). Attempts to fetch them via the GLOBAL or US endpoints will return a 404 Not Found.
+________________
+
+
+97. Operational Metadata: The "Origin" Chain
+To prevent "Circular Payments" (where Service A pays Service B, which pays Service A), Nexus tracks the Origin Chain in the transaction metadata.
+97.1 Loop Detection
+If a transaction's origin chain contains the same Identity ID more than twice in a 24-hour window, the transaction is flagged for "Structuring Review."
+________________
+
+
+98. SDK Circuit Breaking (Client-Side)
+Official Nexus SDKs (Section 35.2) include a client-side circuit breaker.
+* Behavior: If the SDK detects that the Nexus API is returning 5xx errors for > 20% of requests, it will "fail fast" locally for 10 seconds.
+* Integration Rule: Your service MUST be prepared to catch a NexusCircuitOpenException and provide a graceful fallback (e.g., "Payments temporarily unavailable").
+________________
+
+
+99. The "Golden" Response Rule
+Nexus guarantees that certain fields will NEVER be removed or renamed in a Major Version. These "Golden Fields" include:
+* id
+* status
+* amount.value
+* amount.currency
+* created_at
+________________
+
+
+100. Specification Conclusion
+This concludes the 100-section foundational specification for the Nexus Payment Platform. This document is now the "Single Source of Truth" for all backend engineers and integrators.
+[END OF DOCUMENT]
+
+
+________________
+
+
+101. Post-Settlement Reconciliation: The "Balance-at-Time" Query
+While current balances are accessible via standard GET requests, financial auditing often requires "As-Of" reporting.
+101.1 Historical Balance Retrieval
+GET /v1/accounts/{account_id}/balance?at_timestamp=2025-12-31T23:59:59Z
+Behavior: Nexus performs a "Point-in-Time" (PIT) recovery of the ledger state. It calculates the balance by taking the current snapshot and reversing all journal entries (Section 32) occurred between the current time and the target timestamp.
+Constraints:
+* Limit: PIT queries are restricted to the last 3 years of data.
+* Latency: These queries bypass the "Hot-Shard" cache (Section 73) and query the cold-storage partitions; expect latency between 1.0s and 3.0s.
+________________
+
+
+102. Idempotency Key Scoping: The "Namespace" Header
+In microservices architectures where multiple sub-systems might use the same database sequence or UUID generator, there is a risk of X-Idempotency-Key collisions across different service domains.
+102.1 The X-Nexus-Idempotency-Namespace
+Integrators can provide a namespace string (e.g., service_name:environment) to isolate their keys.
+* Unique Tuple: Nexus treats the combination of (Namespace + Key + ClientID) as the unique constraint.
+* Recommendation: Use your service’s deployment ID as the namespace to ensure that a blue-green rollback doesn't accidentally trigger idempotency logic against the "new" version's keys.
+________________
+
+
+103. Transactional Webhooks: Atomic Processing
+To prevent out-of-order event processing, Nexus supports Ordered Delivery for specific resources.
+103.1 Sequence Numbers
+Every webhook payload includes a sequence_number.
+Rule: For a specific payment_id, Nexus guarantees that the payment.succeeded event will have a higher sequence_number than the payment.created event.
+Integrator Requirement:
+If your service receives sequence_number: 10 followed by sequence_number: 8 for the same resource, you MUST ignore the latter, as it represents a delayed delivery of a stale state.
+________________
+
+
+104. Failure Mode: The "Safe-to-Retry" Error Flag
+Not all 4xx or 5xx errors are created equal. Nexus classifies every error to assist your service's retry manager.
+104.1 The retry_strategy Object
+In the error response (Section 5.1), a retry_strategy object is included:
+JSON
+{
+  "error": {
+    "code": "BANK_GATEWAY_TIMEOUT",
+    "retry_strategy": {
+      "should_retry": true,
+      "recommended_backoff_ms": 1500,
+      "idempotency_safe": true
+    }
+  }
+}
+
+
+* idempotency_safe: true: The request was rejected before any state change occurred. It is safe to retry even without an idempotency key (though one is always required by policy).
+* idempotency_safe: false: The request reached the ledger. You MUST use the same idempotency key for any retry to avoid double-debiting.
+________________
+
+
+105. Custom Merchant Identifiers (DBA Aliases)
+For white-label platforms, the billing descriptor on a customer's bank statement must often reflect the sub-merchant's name rather than the platform's name.
+105.1 Descriptor Suffixes
+POST /v1/payments
+Parameter: statement_descriptor_suffix
+* Length: Max 10 characters.
+* Format: Alphanumeric and spaces only.
+* Output: The final descriptor will be PLATFORM* <SUFFIX>.
+________________
+
+
+106. System-Level Health: The "Backpressure" Signal
+When Nexus detects a surge in traffic that threatens its 99.99% availability, it initiates Backpressure rather than hard-failing requests.
+106.1 The X-Nexus-Backpressure Header
+If this header is present in a 2xx response, it indicates the system is at 80%+ capacity.
+* Client Action: Integrators SHOULD throttle non-critical traffic (like background reconciliation or reporting) until the header is no longer present.
+________________
+
+
+107. Payout Orchestration: Multi-Step Verification
+For payouts to high-risk regions, Nexus enforces a "Verification Challenge" before the funds are transmitted to the rail.
+107.1 The action_required Status
+The payout status will move from PENDING to ACTION_REQUIRED.
+Required Action:
+The integrator must call POST /v1/payouts/{id}/verify with a One-Time Password (OTP) sent to the merchant's registered phone number or email.
+________________
+
+
+108. API Documentation: The "Mock" Header
+To facilitate development without using the full Sandbox environment, the production API supports a mock mode for specific requests.
+108.1 X-Nexus-Mock: true
+* Effect: The API validates the request but does not contact the database or the bank.
+* Response: Returns a statically generated "Success" response.
+* Constraint: MUST NOT be used for any production traffic. Requests with this header are limited to 1 RPS and are heavily audited.
+________________
+
+
+109. Advanced Ledger Operations: Bulk Adjustments
+Used primarily by the Treasury team for month-end close or correcting system-wide rounding errors.
+109.1 POST /v1/ledger/adjustments
+Allows for a single "N-Legged" entry where multiple accounts are debited and credited in one atomic transaction.
+Constraint: The total debits must exactly equal total credits in the request body, or the call fails with LEDGER_IMBALANCE.
+________________
+
+
+110. Final Architectural Constraint: Zero-Knowledge PII
+Nexus is moving toward a Zero-Knowledge architecture for PII. In future versions, all identity data (Section 14) will be encrypted with a key derived from the client's client_secret.
+* Impact: Nexus administrators will be unable to view raw PII even with database access.
+* Requirement: Clients will be responsible for providing the decryption context for any manual support tickets.
+________________
+
+
+[DOCUMENT PART 1 TERMINATED - ARCHIVE REFERENCE: NEXUS-SPEC-2026-Q1]
+
+
+________________
+
+
+111. High-Precision Currency Calculations
+To eliminate the systemic risk of "Penny Clipping" (rounding errors accumulating over millions of transactions), Nexus enforces a strict fixed-point arithmetic protocol.
+111.1 The Six-Decimal Rule
+While the Money Object (Section 6.1) displays values in their native decimal format (e.g., 2 decimals for USD), the internal engine calculates all ledger movements using a 6-decimal precision factor.
+* Rounding Direction: Nexus uses Banker's Rounding (Round Half to Even) for all intermediate fee calculations.
+* Rounding Remainder: Any fractional remainder lost during the final conversion to a bank-ready format (2 decimals) is credited to a centralized SYSTEM_ROUNDING_RESIDUAL account to ensure the global ledger remains balanced to the smallest unit.
+________________
+
+
+112. Intelligent Retry-After Logic
+When a service is rate-limited (Section 4) or a bank rail is congested, Nexus provides a deterministic wait time to prevent "Thundering Herd" issues after a recovery.
+112.1 The Retry-After Header
+In accordance with RFC 7231, all 429 and 503 responses include a Retry-After header.
+Rules for Integrators:
+* If the value is an integer, it represents seconds to wait.
+* If the value is a HTTP-date, it represents the absolute time to resume requests.
+* Penalty: Repeatedly polling an endpoint before the Retry-After window expires will result in an automatic "Cool-off" penalty, doubling the previous wait time.
+________________
+
+
+113. Payment Method Metadata and Fingerprinting
+To assist in fraud detection and prevent account takeover (ATO) attacks, Nexus generates a non-PII unique identifier for every payment instrument.
+113.1 fingerprint Attribute
+In the PaymentMethod object, the fingerprint is a hash of the card's PAN or the bank's account/routing combination.
+* Stability: The fingerprint remains constant even if the payment_method_id changes.
+* Usage: Integrators SHOULD use this to detect if a single physical card is being used across multiple Identity profiles, which is a high-confidence signal for "mule" activity.
+________________
+
+
+114. Asynchronous Request Pattern (The Long-Running Job)
+Certain administrative operations, such as generating a year-long transaction export (Section 18.1), cannot be completed within the 30-second HTTP read timeout.
+114.1 Status Polling Pattern
+For these operations, Nexus returns a 202 Accepted with a Job object.
+Job States:
+1. QUEUED: The request is in the processing buffer.
+2. IN_PROGRESS: Data is being pulled from cold storage.
+3. COMPLETED: The result is ready for download.
+4. FAILED: An error occurred during generation (see error block for details).
+________________
+
+
+115. Network-Level Redundancy: Global Accelerator
+Nexus uses a Global Anycast network to minimize latency for integrators operating across different continents.
+115.1 Point-of-Presence (PoP) Routing
+When a client hits api.nexus.internal, the request is routed to the nearest PoP.
+* Termination: TLS 1.3 is terminated at the edge.
+* Backhaul: The request is then carried over the private internal backbone to the appropriate regional shard (Section 59.1).
+* Benefit: This reduces the TCP handshake time by up to 150ms for cross-continental requests.
+________________
+
+
+116. Ledger Integrity: The "Merkle Tree" Proof
+For Tier-0 transparency, every block of ledger entries (Section 15) is hashed into a Merkle Tree structure.
+116.1 X-Nexus-Ledger-Proof
+Upon request, a SUCCEEDED payment response can include a cryptographic proof that the transaction has been permanently recorded in the immutable ledger.
+* Verification: Integrators can use the Nexus public key to verify that the transaction hash is part of the latest "Ledger Root," ensuring that the record cannot be tampered with by any internal or external actor.
+________________
+
+
+117. API Performance: The "Include" Parameter
+To prevent "N+1" query problems, Nexus supports resource sideloading via the include[] query parameter.
+117.1 Sideloading Related Resources
+GET /v1/payments/{id}?include[]=identity&include[]=payout
+Response Structure:
+JSON
+{
+  "id": "pay_123",
+  "status": "SUCCEEDED",
+  "included": {
+    "identity": { "id": "ident_456", "legal_name": "Acme Corp" },
+    "payout": { "id": "po_789", "status": "PENDING" }
+  }
+}
+
+
+* Constraint: A maximum of 3 resources can be sideloaded per request to maintain p95 latency targets.
+________________
+
+
+118. Legal and Compliance: The "Freeze" Priority
+In the event of conflicting legal orders (e.g., a domestic tax levy vs. an international sanctions hit), Nexus follows a deterministic Freeze Priority Matrix.
+1. AML/Sanctions (Tier 1): Highest priority; overrides all other locks.
+2. Fraud/Risk (Tier 2): Intermediate priority.
+3. Internal Disputes (Tier 3): Lowest priority.
+________________
+
+
+119. SDK Middleware: Observability Injection
+The official SDKs (Section 35.2) automatically inject an observability block into the request metadata.
+Captured Context:
+* sdk_version: e.g., nexus-go-v1.4.2
+* runtime_version: e.g., go1.21.1
+* container_id: (If running in Kubernetes/Docker)
+* availability_zone: The specific AZ of the calling service.
+This data is used by the Nexus Platform Team to identify and troubleshoot issues specific to certain client runtimes.
+________________
+
+
+120. Final System Constraint: Request Expiry
+To prevent "Zombie Requests"—old requests that were delayed in a network queue and suddenly arrive at the server—Nexus enforces a strict 60-second request window.
+120.1 The Date Header
+All requests MUST include a standard Date header.
+* Validation: If the difference between the Date header and the Nexus system clock is greater than 60 seconds, the request is rejected with 400 Bad Request and error code REQUEST_EXPIRED.
+________________
+
+
+[DOCUMENT PART 1 TERMINATED - ARCHIVE REFERENCE: NEXUS-SPEC-2026-Q1-FINAL]
+________________
+
+
+121. Liquidity Reservation and "Pre-Funding" Workflows
+For services that require guaranteed availability of funds for high-priority batches (e.g., payroll cycles or high-value settlement windows), Nexus supports Liquidity Reservations.
+121.1 Create Reservation
+POST /v1/liquidity/reservations
+A reservation moves funds from an account's available_balance to a reserved_balance, ensuring they cannot be consumed by other concurrent processes.
+Request Body:
+JSON
+{
+  "account_id": "acc_01H2J",
+  "amount": { "currency": "USD", "value": "500000.00" },
+  "expires_at": "2026-01-20T00:00:00Z",
+  "description": "Quarterly Payroll Buffer"
+}
+
+
+121.2 Consumption Logic
+To use reserved funds, the POST /v1/payouts or POST /v1/payments request MUST include the reservation_id. If the ID is valid and the amount is within the reserved limit, the transaction proceeds without a standard liquidity check.
+________________
+
+
+122. Advanced Reconciliation: The "Transaction-Tree" Trace
+In complex marketplaces where a single payment results in multiple splits, fees, and secondary transfers (Section 53), tracking the "lineage" of a dollar is required for audit.
+122.1 Parent-Child Resource Mapping
+Every ledger entry in Nexus includes a source_trigger_id.
+* If a payment pay_abc triggers a fee fee_123, the fee's source_trigger_id will be pay_abc.
+* This creates a directed graph of fund movements, allowing auditors to reconstruct the entire lifecycle of a payment from intake to final disbursement.
+________________
+
+
+123. Global Connectivity: The "Bank-Rail" Failover Matrix
+Nexus maintains a dynamic routing table for all external rails. In the event of a regional banking outage, the system performs an Automated Route Re-selection.
+123.1 Failover Hierarchy
+1. Direct Host-to-Host: Primary route (lowest latency).
+2. SWIFT GPI: Secondary route for international transfers.
+3. Regional Correspondent: Tertiary fallback.
+Integrator Impact: During a failover event, the X-Nexus-Rail-Status header (Section 85) will switch to Yellow, and p99 latency for payouts may increase by up to 300% as the system switches from modern REST-based banking APIs to legacy ISO 20022 XML file transfers.
+________________
+
+
+124. Security: The "Step-Up" Authentication Challenge
+For operations that deviate from a service's established "Behavioral Profile" (e.g., an sudden increase in payout volume to a new country), Nexus triggers a Step-Up Challenge.
+124.1 Challenge Types
+* MFA_REQUIRED: Requires a TOTP or WebAuthn signature from an authorized administrator.
+* MANUAL_RECOVERY: The transaction is held until a Nexus Support Engineer manually verifies the intent with the calling team's on-call lead.
+________________
+
+
+125. API Response Metadata: The "Computation-Time" Header
+To help integrators differentiate between network latency and server-side processing time, Nexus provides the X-Nexus-Computation-Time-MS header.
+* Usage: If total request time is 1000ms but computation time is 50ms, the bottleneck is in the network (likely a regional routing issue). If computation time is 950ms, the bottleneck is in the Nexus ledger (likely due to account-level lock contention, See Section 73).
+________________
+
+
+126. Idempotency Key Recycling Policy
+To prevent the permanent growth of the idempotency index, Nexus implements a "Recycling Window."
+* Window: 24 Hours.
+* Rule: You MAY reuse an idempotency key after 24 hours. However, doing so will result in a completely new transaction. Nexus will NOT return the cached response of the previous transaction once the window has closed.
+________________
+
+
+127. Compliance: "Sanctioned-Entity" Response Patterns
+When a POST /v1/payments or POST /v1/identities request involves an entity on a prohibited list (e.g., OFAC Specially Designated Nationals), the API will return a 403 Forbidden.
+127.1 Generic Error Response
+To remain compliant with anti-tipping-off regulations, the error response will be intentionally generic:
+JSON
+{
+  "error": {
+    "code": "REQUEST_DENIED",
+    "message": "The request could not be completed due to internal system policy.",
+    "request_id": "req_xyz_778"
+  }
+}
+
+
+Internal logs will contain the specific violation details (e.g., MATCH: OFAC_SDN_LIST), but this is never exposed via the public API.
+________________
+
+
+128. Batch Processing: Atomic vs. Non-Atomic Batches
+When using the Bulk API (Section 34), integrators can specify the atomicity level.
+* ALL_OR_NOTHING: If one instruction in the batch fails, the entire batch is rolled back. This is only available for batches under 100 items.
+* PARTIAL_SUCCESS: (Default) Each instruction is treated as an independent transaction. The response contains a summary of successes and failures.
+________________
+
+
+129. Developer Experience: "Postman-Compatible" Collections
+The Nexus team publishes a machine-readable OpenAPI 3.1 Definition at the /v1/spec endpoint.
+* Feature: This spec includes pre-configured environment variables and test scripts to verify HMAC signatures and JWT exchanges locally.
+________________
+
+
+130. Final Protocol Specification: Connection Draining
+During a regional shard migration (Section 59), Nexus uses a Connection Draining strategy.
+* Signal: The server sends a Connection: close header in all responses.
+* Client Action: Clients MUST terminate the current TCP connection and establish a new one. This ensures the client is re-routed to the new, updated cluster without dropping active requests.
+________________
+
+
+[DOCUMENT PART 1 TERMINATED - ARCHIVE REFERENCE: NEXUS-SPEC-2026-v1-REV-09]
+________________
+
+
+131. Ledger Locking: The "Optimistic Concurrency" Protocol
+In addition to the distributed counters used for high-traffic accounts (Section 73), Nexus employs an Optimistic Concurrency Control (OCC) mechanism for resource-level updates (e.g., updating an Identity's legal status or modifying a Payout's metadata).
+131.1 Version-Based Headers
+Every resource response includes an ETag header representing the current version hash of that object.
+The Workflow:
+1. Client fetches the resource and stores the ETag.
+2. Client sends a PATCH request with the If-Match: <ETag> header.
+3. If the resource has been modified by another process in the interim, Nexus returns a 412 Precondition Failed.
+Rule: Integrators MUST implement a "Fetch-Modify-Retry" loop when handling 412 errors to ensure data consistency in multi-threaded environments.
+________________
+
+
+132. Advanced Webhooks: Payload Filtering and Projections
+To reduce the bandwidth consumption of high-volume integrators, Nexus supports Webhook Projections. This allows clients to receive only a subset of the Event object.
+132.1 Filter Configuration
+PATCH /v1/webhook_endpoints/{id}
+Request Body:
+JSON
+{
+  "projection": ["id", "type", "data.object.status", "data.object.amount"],
+  "filter_expression": "data.object.amount.value > 1000.00"
+}
+
+
+* Projection: Only the specified fields are included in the webhook body.
+* Filter Expression: The webhook is only triggered if the condition is met (e.g., only notify for high-value payments).
+________________
+
+
+133. Platform-Wide Search: The "Global Index"
+While individual resources are queried via REST, Nexus provides a low-latency Global Search endpoint for cross-resource discovery.
+133.1 Search Query Syntax
+GET /v1/search?query=...
+The query engine supports a simplified Lucene-like syntax:
+* status:SUCCEEDED AND amount.currency:EUR
+* metadata.customer_id:cust_992*
+* created_at:[2026-01-01 TO 2026-01-19]
+SLA: The Global Index is eventually consistent, with a synchronization lag of typically < 500ms from the primary ledger.
+________________
+
+
+134. Security: The "Time-Limited" Grant (Token Scoping)
+For support scenarios where a developer needs to debug a specific production transaction, Nexus supports Point-in-Time Scoped Tokens.
+134.1 The "Grant" Object
+An administrator can issue a JWT that is restricted to a single payment_id and expires in 60 minutes.
+* Audit Rule: Use of a scoped grant triggers a high-priority audit event: SECURITY_DEBUG_SESSION_STARTED.
+* Constraint: These tokens MUST NOT be used for automated service-to-service communication.
+________________
+
+
+135. The "Nexus-Backfill" Utility: Data Synchronization
+If an integrator suffers a local database outage and misses a series of webhook events, they can utilize the Backfill API.
+135.1 Requesting a Replay
+POST /v1/webhooks/replay
+Request Parameters:
+* start_time: ISO 8601 timestamp.
+* end_time: ISO 8601 timestamp.
+* webhook_endpoint_id: The destination for the replayed events.
+Behavior: Nexus will re-enqueue all events that occurred in the window. Replayed events will include the header X-Nexus-Is-Replay: true.
+________________
+
+
+136. Compliance: The "Right to Erasure" Implementation
+In compliance with global privacy laws, Nexus provides a specific workflow for the "Right to be Forgotten" while maintaining financial auditability.
+136.1 Redaction vs. Deletion
+1. PII Redaction: Fields like name, email, and address in the Identity object are overwritten with a cryptographic hash or a null value.
+2. Ledger Retention: The amount, timestamp, and transaction_id are preserved for 7 years to satisfy tax and AML laws.
+3. Reference Integrity: The identity_id remains constant to maintain the link between transaction history and the (now anonymized) user.
+________________
+
+
+137. API Performance: Response Streaming (Chunked Encoding)
+For very large GET requests (e.g., listing 10,000 internal transfers), Nexus utilizes Transfer-Encoding: chunked.
+Integrator Requirement:
+Client libraries MUST support stream processing. Attempting to buffer the entire response into memory before parsing can lead to OutOfMemory errors in low-resource environments (e.g., Lambda/Functions).
+________________
+
+
+138. Transactional Semantics: The "Check-and-Set" (CAS) Payout
+To prevent race conditions when multiple services attempt to pay out from the same pool account (Section 40), Nexus supports a CAS Payout mode.
+138.1 Conditional Payouts
+POST /v1/payouts
+Parameter: expected_balance
+* Logic: Nexus checks the current account balance. If it does not match expected_balance, the payout is rejected with a 409 Conflict.
+* Use Case: Ensuring that two parallel payout batches do not accidentally overdraw a pool account due to stale balance information.
+________________
+
+
+139. System Constraints: The "Idempotency-Key-Format" Rule
+To optimize indexing, X-Idempotency-Key values must adhere to a strict format.
+* Constraint: Keys MUST be between 16 and 64 characters.
+* Allowed Characters: [a-zA-Z0-9_\-].
+* Prohibited: Special characters or whitespace.
+* Penalty: Requests with invalid key formats return 400 Bad Request before any authentication logic is performed to protect the gateway from injection attacks.
+________________
+
+
+140. End-of-Part 1 Summary
+This document has defined the core architectural framework for the Nexus Payment Platform across 140 sections. Key pillars established include:
+* Exactly-Once Processing via strict idempotency and fingerprinting.
+* Tier-0 Resilience via regional sharding and chaos-tested failover.
+* Regulatory Rigor via automated AML/Sanctions screening and immutable ledger entries.
+* Developer Predictability via semantic versioning and standardized error schemas.
+[NEXUS PLATFORM SPECIFICATION v1.0.0-BETA - PART 1 COMPLETE]
+
+
+________________
+
+
+141. Service Continuity and Maintenance Handover
+As Nexus is a living platform, this specification transitions from foundational architecture to the operational handover protocols required for long-term maintenance by the Platform Engineering and SRE teams.
+141.1 Post-Mortem and Incident Transparency
+In the event of an SLO breach (Section 29), Nexus publishes a Public Incident Report (PIR) within 48 hours to all internal stakeholders.
+* Content: Root cause analysis (RCA), impact scope, and a timeline of corrective actions.
+* Visibility: Accessible via the GET /v1/system/incidents endpoint for automated ingestion by service health dashboards.
+________________
+
+
+142. Final Security Tiering: The "Admin-Lock"
+For ultra-high-risk accounts (e.g., Corporate Treasury Root), an additional layer of security called Admin-Lock can be enabled.
+* Behavior: Mutation requests to these accounts via the API are blocked by default.
+* Unlock Procedure: Requires a time-bound "Window of Intent" opened via a physical security key at a secure terminal.
+* API Response: If an account is Admin-Locked, Nexus returns 403 Forbidden with the sub-code ACCOUNT_ADMIN_LOCKED.
+________________
+
+
+143. Migration Paths from Legacy Ledger (v0.9)
+For teams still operating on the v0.9-Alpha branch, the following migration utility is available.
+143.1 The "Sync" Bridge
+POST /v1/migration/sync
+Allows a v0.9 resource ID to be mapped to a v1.0 resource ID. This ensures that historical payment data remains searchable during the transition period.
+________________
+
+
+144. Governance: The Architectural Decision Record (ADR)
+All design choices within this document (e.g., the decision to use Cursor-based pagination in Section 8.1) are backed by an internal ADR.
+* Integrators who wish to propose changes to this specification must submit a formal RFC (Request for Comments) to the nexus-arch-board@company.com.
+________________
+
+
+145. Summary of MUST/MUST NOT Constraints
+To conclude Part 1, the following table summarizes the most critical constraints defined across the document:
+Category
+	Constraint
+	Reference
+	Idempotency
+	MUST use X-Idempotency-Key for all POST/PATCH.
+	Section 1.1
+	Currency
+	MUST use ISO 4217 strings (e.g., "USD").
+	Section 1.2
+	Pagination
+	MUST NOT use OFFSET; MUST use cursors.
+	Section 8.1
+	Webhooks
+	MUST verify HMAC-SHA256 signatures.
+	Section 9.3
+	PII
+	MUST NOT log raw PII in client-side logs.
+	Section 24.2
+	Rounding
+	MUST use Banker's Rounding for fees.
+	Section 111
+	________________
+
+
+146. Final Version Attestation
+Specification ID: NEXUS-CORE-V1-FINAL-2026
+Status: PROMOTED TO PRODUCTION
+Approved By: Global Payments Architecture Committee
+This concludes Part 1 of the Nexus API Specification. This document covers the core payment primitives, security protocols, and ledger integrity rules.
+Upcoming Parts:
+* Part 2: Specialized Regional Adapters (APAC/LATAM specifics).
+* Part 3: Advanced Treasury & Liquidity Forecasting.
+* Part 4: Partner Gateway & Third-Party Integrations.
+________________
+
+
+[DOCUMENT COMPLETE]
+Payment Nexus API Specification (v1.0.0-Beta)
+PART 2: Global Connectivity & Treasury Operations
+This document continues the Nexus API Specification, moving from foundational ledger logic to the execution of fund movements across global banking rails and complex liquidity management.
+________________
+
+
+147. External Banking Adapters (The Bridge Layer)
+The Bridge Layer is a set of specialized micro-services that translate Nexus standard instructions into the specific, often legacy, formats required by global financial institutions.
+147.1 The Unified Rail Interface
+While Nexus abstracts these differences, integrators can pass rail_options to influence the selection of a specific downstream network.
+Standard Rail Identifiers:
+* US_ACH: Automated Clearing House (Standard/Same-Day).
+* US_WIRE: FedWire (Real-time settlement).
+* EU_SEPA_INST: SEPA Instant Credit Transfer.
+* UK_FPS: Faster Payments Service.
+* SWIFT_GPI: Global Payments Innovation (International).
+147.2 Rail-Specific Schema Extensions
+When initiating a payout via POST /v1/payouts, the rail_options object allows for network-specific requirements.
+Example: SEPA Instant Payout
+JSON
+{
+  "amount": { "currency": "EUR", "value": "1200.00" },
+  "destination": { "id": "dest_8821" },
+  "rail_options": {
+    "type": "EU_SEPA_INST",
+    "remittance_info": "Inv-9901-Nexus",
+    "creditor_agent_bic": "EXAMPP2L"
+  }
+}
+
+
+________________
+
+
+148. ISO 20022 Mapping & Status Correlation
+Nexus uses ISO 20022 as its internal canonical format for financial messaging. All external bank responses are mapped back to the standard PaymentStatus (Section 28).
+148.1 Status Code Translation Table
+ISO 20022 External Status
+	Nexus Status
+	Description
+	ACCP (AcceptedCustomerProfile)
+	PROCESSING
+	Pre-validation successful at the bank.
+	ACSC (AcceptedSettlementCompleted)
+	SUCCEEDED
+	Funds have been cleared and settled.
+	RJCT (Rejected)
+	FAILED
+	Bank rejected the instruction (See Reason Codes).
+	PDNG (Pending)
+	PROCESSING
+	Transaction is held for manual bank review.
+	________________
+
+
+149. Liquidity Reservations & Pre-Funding
+To prevent "Race Conditions" in high-volume payout scenarios (e.g., a $10M payroll batch), Nexus allows services to "Reserve" liquidity before execution.
+149.1 Create Reservation
+POST /v1/liquidity/reservations
+Request Body:
+JSON
+{
+  "account_id": "acc_treasury_01",
+  "amount": { "currency": "USD", "value": "10000000.00" },
+  "expires_at": "2026-01-20T18:00:00Z",
+  "metadata": { "batch_ref": "PAYROLL_JAN_26" }
+}
+
+
+Constraints:
+* Exclusive Access: Reserved funds are moved to a RESERVED ledger bucket and cannot be used by standard POST /v1/payments calls.
+* Auto-Release: If not consumed by the expires_at timestamp, funds are automatically returned to available_balance.
+________________
+
+
+150. Multi-Region Sharding & Data Residency
+Nexus operates across geographically isolated shards to comply with local data sovereignty laws (e.g., GDPR, LGPD).
+150.1 The Regional Routing Header
+Integrators MUST target the correct regional gateway. A mismatch between the Identity residency and the gateway will result in a 301 Redirect.
+* US Shard: https://us.api.nexus.internal
+* EU Shard: https://eu.api.nexus.internal
+* APAC Shard: https://apac.api.nexus.internal
+150.2 Cross-Region Atomic Transfers
+When moving funds between shards (e.g., US to EU), Nexus utilizes a Two-Phase Commit (2PC) internal protocol.
+1. Prepare: US Shard locks funds and generates a Global-X-ID.
+2. Commit: EU Shard receives the instruction and credits the recipient.
+3. Acknowledge: US Shard finalizes the debit upon confirmation from the EU Shard.
+________________
+
+
+151. Automated Sweep Protocols
+For organizations with hundreds of sub-accounts (Section 31), Nexus provides a "Target Balancing" service to automate internal liquidity moves.
+151.1 Sweep Configuration
+POST /v1/accounts/{id}/sweep_configs
+Configuration Parameters:
+* min_balance: The threshold that triggers an inflow from the parent account.
+* max_balance: The threshold that triggers an outflow to the parent account.
+* schedule: Frequency of evaluation (e.g., CRON: 0 * * * * for hourly).
+________________
+
+
+152. Advanced Fraud: Risk-Based Authentication (RBA)
+Nexus integrates a real-time Risk Engine that evaluates every transaction for anomalies.
+152.1 The "Step-Up" Challenge
+If a transaction returns a risk_score > 75, the API returns a 403 Forbidden with a challenge_required payload.
+Example Response:
+JSON
+{
+  "error": {
+    "code": "CHALLENGE_REQUIRED",
+    "next_step": "OTP_VERIFICATION",
+    "challenge_id": "chal_99201",
+    "message": "High-risk transaction detected. Please verify via MFA."
+  }
+}
+
+
+________________
+
+
+153. Reporting: The "Snapshot" API
+While Part 1 covered real-time list views, Part 2 introduces the high-volume Snapshot API for data warehouse ingestion.
+153.1 Requesting a Ledger Snapshot
+POST /v1/reports/snapshots
+This initiates a background job to export the entire state of a ledger at a specific point in time (Section 101).
+* Format: Apache Parquet (optimized for BigQuery/Snowflake).
+* Delivery: Webhook notification with a pre-signed S3/GCS URL.
+________________
+
+
+
+
+________________
+
+
+154. Foreign Exchange (FX) Advanced Execution
+For global enterprises, managing currency volatility is a Tier-1 operational requirement. Nexus Part 2 expands the basic FX quote logic into a full-scale execution engine.
+154.1 Guaranteed vs. Mid-Market Rates
+* Mid-Market: Real-time indicative rates provided via GET /v1/fx/rates. These are for estimation only and MUST NOT be used for settlement.
+* Guaranteed Quotes: Fixed rates locked for a specific window (typically 60 seconds). These require a quote_id for execution.
+154.2 Forward Contracts (Liquidity Locking)
+POST /v1/fx/forwards
+Allows the Treasury team to lock an exchange rate for a future date (e.g., T+30).
+* Collateral: Nexus may place a RESERVE lock on 10% of the contract value to mitigate counterparty risk.
+* Execution: Once the forward matures, the forward_id can be passed as the fx_source in a Payment Intent.
+________________
+
+
+155. Real-Time Gross Settlement (RTGS) Adapters
+RTGS systems are the "critical infrastructure" of the financial world, handling high-value, time-sensitive transfers.
+155.1 Priority Routing logic
+When a payout is marked with priority: URGENT, the Nexus Router bypasses batch-based rails (like ACH) and targets RTGS adapters directly.
+* US: FedWire (via the FRB-Nexus bridge).
+* UK: CHAPS.
+* EU: TARGET2.
+Constraint: RTGS transfers are subject to higher flat-fee surcharges and MUST be submitted before the regional cut-off time (e.g., 17:00 ET for FedWire).
+________________
+
+
+156. Compliance: The "Travel Rule" for Cross-Border Transfers
+To comply with FATF Recommendation 16, Nexus requires the transmission of PII alongside high-value international transfers.
+156.1 The originator_data Block
+For any cross-border payout exceeding $3,000 USD (or equivalent), the following fields are MANDATORY:
+* full_legal_name
+* physical_address
+* national_identity_number OR date_and_place_of_birth
+Rule: Failure to provide this data for a cross-border request will trigger a 422 Unprocessable Entity with the code TRAVEL_RULE_DATA_MISSING.
+________________
+
+
+157. Advanced Webhook Security: Signature Versioning
+To allow for non-breaking security upgrades to the webhook verification process, Nexus supports multiple signature versions.
+157.1 Multi-V-Signature Headers
+The X-Nexus-Signature header now supports a comma-separated list of versions:
+v1=hash_abc,v2=hash_xyz
+* v1: HMAC-SHA256 (Legacy).
+* v2: Ed25519 EdDSA (Modern, asynchronous signing).
+Requirement: Integrators SHOULD migrate to v2 verification as v1 is scheduled for deprecation in Q4 2026.
+________________
+
+
+158. Ledger Integrity: The "Shadow Account" Mirror
+To ensure that the Nexus internal ledger stays perfectly synchronized with the physical bank accounts, Nexus maintains Shadow Accounts.
+158.1 The Reconciliation Loop
+1. Nexus Event: Payment is marked SUCCEEDED in the internal ledger.
+2. Bank Statement: Nexus ingests a CAMT.053 bank statement file via the Bridge Layer.
+3. Matching: The StatementItem is matched against the LedgerEntry using the EndToEndId.
+4. Correction: If the bank settled $0.01 less than expected due to an unmodeled fee, Nexus automatically generates an ADJUSTMENT entry to the Shadow Account.
+________________
+
+
+159. Identity: Ultimate Beneficial Owner (UBO) Verification
+For BUSINESS identities (Section 14.1), anti-money laundering laws require the identification of the natural persons who own or control the entity.
+159.1 The UBO Schema
+JSON
+{
+  "business_id": "ident_biz_772",
+  "beneficial_owners": [
+    {
+      "name": "John Smith",
+      "ownership_percentage": 25.5,
+      "role": "CEO",
+      "is_controlling_person": true
+    }
+  ]
+}
+
+
+Constraint: A business cannot be VERIFIED until the sum of controlling ownership is documented and verified against corporate registries.
+________________
+
+
+160. Operational Observability: The "Rail-Latency" Metric
+Part 2 introduces high-granularity performance tracking for downstream banks.
+160.1 GET /v1/system/rail_metrics
+Returns p50, p95, and p99 latency for every active bank rail.
+Response:
+JSON
+{
+  "rail": "US_ACH_CHASE",
+  "status": "OPERATIONAL",
+  "metrics": {
+    "p95_ack_ms": 120,
+    "p95_settlement_hours": 24.5
+  }
+}
+
+
+________________
+
+
+161. Marketplace Funds Management: Delayed Disbursement
+In marketplace environments (e.g., e-commerce platforms or gig economy apps), Nexus allows for the decoupling of funds intake and final vendor settlement to account for refund windows and dispute mediation.
+161.1 The "Holding" Period
+When a payment is captured (Section 7.2), funds can be directed into a restricted sub-account (Section 31.1) with a release_at directive.
+Request Extension:
+JSON
+{
+  "amount": { "value": "200.00", "currency": "USD" },
+  "disbursement_schedule": {
+    "release_at": "2026-01-26T00:00:00Z",
+    "hold_reason": "REFUND_WINDOW_PROTECTION"
+  }
+}
+
+
+161.2 Manual Release Overrides
+POST /v1/payments/{payment_id}/release
+Administrators with the payments.write scope may override the schedule to release funds immediately if the merchant passes additional risk verification.
+________________
+
+
+162. Advanced Ledger Structures: Multi-Currency Pools
+Nexus Part 2 introduces the concept of Currency Buckets within a single logical account, allowing a business to hold multiple currencies without opening multiple account_id entities.
+162.1 Multi-Currency Object
+JSON
+{
+  "account_id": "acc_global_01",
+  "balances": {
+    "USD": { "available": "1000.00", "pending": "50.00" },
+    "EUR": { "available": "850.00", "pending": "0.00" },
+    "GBP": { "available": "40.00", "pending": "10.00" }
+  }
+}
+
+
+162.2 Cross-Bucket Transfers
+Internal transfers (Section 32) can now specify both source_currency and destination_currency. If they differ, Nexus automatically attaches an FX Quote (Section 19) to the journal entry.
+________________
+
+
+163. The "Direct-to-Ledger" (DTL) Protocol
+For internal high-frequency trading services or automated treasury bots, the standard REST overhead may be too high. Nexus provides a DTL Protocol over gRPC for direct ledger insertion.
+163.1 gRPC Service Definition
+Protocol Buffers
+service LedgerService {
+  rpc CreateEntry(LedgerRequest) returns (LedgerResponse) {}
+}
+
+
+message LedgerRequest {
+  string idempotency_key = 1;
+  AccountAmount credit = 2;
+  AccountAmount debit = 3;
+  google.protobuf.Timestamp effective_date = 4;
+}
+
+
+SLA: DTL requests are optimized for < 50ms p99 latency by bypassing the full API gateway authentication stack in favor of VPC-level mutual TLS trust.
+________________
+
+
+164. Compliance: Automated Sanctions Rescreening
+Sanctions lists (OFAC, UN) are dynamic. An identity verified today may be sanctioned tomorrow. Nexus Part 2 implements Continuous Rescreening.
+164.1 The "Delta" Scan
+Every 24 hours, Nexus matches the entire Identity database against updated global watchlists.
+164.2 The "Status-Interrupt" Webhook
+If an existing Identity is flagged:
+1. All associated accounts are moved to FROZEN (Section 69.1).
+2. A compliance.status_updated webhook is sent.
+3. Requirement: The integrator MUST stop all user-initiated interactions with that account immediately to avoid "Tipping Off."
+________________
+
+
+165. Disaster Recovery: Regional Shard Failover
+Building on the sharding logic (Section 59), Nexus provides a "Active-Passive" failover mechanism for regional outages.
+165.1 Shard Evacuation
+In the event of a total cloud region failure (e.g., us-east-1 goes dark):
+1. Traffic is re-routed to us-west-2.
+2. Read-Only Mode: For the first 5 minutes, the shard operates in read-only mode while the standby database promotes itself to Leader.
+3. Consistency Check: Nexus performs a "Log Gap Analysis" to ensure no X-Idempotency-Key was lost during the transition.
+________________
+
+
+166. Developer Experience: Transaction Simulation (The "Sandbox-Rail")
+To test complex asynchronous flows (like a bank rejection that occurs 3 days after a payout), Nexus provides a specialized Sandbox Rail.
+166.1 Triggering Async Rejections
+POST /v1/sandbox/simulate/rail_rejection
+Request Body:
+JSON
+{
+  "payout_id": "po_9921",
+  "rejection_code": "ACCOUNT_CLOSED",
+  "delay_seconds": 30
+}
+
+
+This allows developers to verify that their webhook handlers for payout.failed correctly trigger downstream logic (e.g., notifying the end-user).
+________________
+
+
+167. Final System Rules: The "Immutability-Chain"
+To satisfy external financial auditors (PwC, Deloitte), Nexus generates a Chain of Custody for every ledger change.
+167.1 Cryptographic Linking
+Each ledger entry contains a prev_entry_hash.
+* This creates a blockchain-like structure within the traditional SQL database.
+* Audit Rule: Any attempt to modify a record in place will break the hash chain, triggering an immediate SYSTEM_INTEGRITY_ALARM to the Security Operations Center.
+________________
+
+
+[WRAPPING UP PART 2: GLOBAL CONNECTIVITY & TREASURY OPERATIONS]
+This document (Parts 1 & 2) now comprises the full 167-section specification for the Nexus Payment Platform. This specification is finalized for the v1.0.0-Beta release.
+Key Technical Outcomes:
+* Scalability: Regional sharding and gRPC DTL protocols support 10k+ RPS.
+* Integrity: Immutability chains and shadow accounts ensure $0.00 variance.
+* Global Reach: Support for 15+ banking rails and 100+ currencies.
+* Safety: Tiered rate limits, mTLS 1.3, and RBA-based step-up authentication.
+[NEXUS API SPECIFICATION v1.0.0-BETA COMPLETE]
