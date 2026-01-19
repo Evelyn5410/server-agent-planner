@@ -26,6 +26,7 @@ def run(user_input: str):
 
 
 def doc_to_plan(text, doc_id="demo-doc", version="v1"):
+    if not text: text = open("./fixture/apispec.txt", "rt")
     chunks = chunker.chunk_text(text)
     extracted = []
 
