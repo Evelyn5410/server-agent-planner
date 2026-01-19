@@ -30,7 +30,7 @@ def doc_to_plan(text, doc_id="demo-doc", version="v1"):
     extracted = []
 
     for chunk in chunks:
-        result = extractor.extract_rules.extract_rules(chunk)
+        result = extractor.extract_rules(chunk)
         extracted.append(result["extracted_rules"])
 
     normalized = [normalizer.normalize_rule(r) for rules in extracted for r in rules]
