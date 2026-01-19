@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    command: uvicorn app.api:endpoint --host 0.0.0.0 --port 8080
+    ports:
+      - "8000:8080"
+    environment:
+      - ARTIFACT_BUCKET=local-artifacts
+    volumes:
+      - ./artifacts:/app/artifacts  

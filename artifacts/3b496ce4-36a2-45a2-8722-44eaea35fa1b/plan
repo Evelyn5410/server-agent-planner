@@ -1,0 +1,9 @@
+{
+  "task": "demo_response",
+  "constraints": [
+    "safe",
+    "concise",
+    "no speculation"
+  ],
+  "input": "Hello AI"
+}
