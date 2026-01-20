@@ -4,7 +4,7 @@ import json
 # Mock mode for local testing without GCP credentials
 MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
 
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.5-flash-lite"
 
 
 class MockUsageMetadata(dict):
@@ -100,14 +100,19 @@ else:
     if not GCP_PROJECT:
         raise RuntimeError("GCP_PROJECT_ID environment variable must be set")
 
-    # Use Vertex AI with project credentials (preferred in Cloud Run with service account)
-    # or API key if provided
+    # Debug: log which auth method is being used
+    print(f"[LLM Client] GCP_PROJECT: {GCP_PROJECT}")
+    print(f"[LLM Client] GCP_LOCATION: {GCP_LOCATION}")
+    print(f"[LLM Client] VERTEX_API_KEY set: {bool(VERTEX_API_KEY)}")
     if VERTEX_API_KEY:
-        client = genai.Client(api_key=VERTEX_API_KEY)
-    else:
-        # Uses default credentials (Workload Identity in Cloud Run)
-        client = genai.Client(
-            vertexai=True,
-            project=GCP_PROJECT,
-            location=GCP_LOCATION,
-        )
+        print(f"[LLM Client] VERTEX_API_KEY length: {len(VERTEX_API_KEY)}")
+        print(f"[LLM Client] VERTEX_API_KEY prefix: {VERTEX_API_KEY[:10]}...")
+
+    # Vertex AI mode: use service account credentials (recommended for Cloud Run)
+    # This uses the Cloud Run service account automatically
+    print("[LLM Client] Using Vertex AI with service account credentials")
+    client = genai.Client(
+        vertexai=True,
+        project=GCP_PROJECT,
+        location=GCP_LOCATION,
+    )
