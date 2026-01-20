@@ -22,18 +22,19 @@ Schema:
 
 
 def plan(user_input: str) -> dict:
+    from google.genai import types
+
     start = time.time()
 
     response = client.models.generate_content(
         model=MODEL,
         contents=[
-            {"role": "system", "parts": [PLANNER_SYSTEM_PROMPT]},
-            {"role": "user", "parts": [f"User request:\n{user_input}"]},
+            {"role": "user", "parts": [{"text": f"{PLANNER_SYSTEM_PROMPT}\n\nUser request:\n{user_input}"}]},
         ],
-        generation_config={
-            "temperature": 0.0,
-            "max_output_tokens": 512,
-        },
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            maxOutputTokens=512,
+        ),
     )
 
     elapsed = time.time() - start

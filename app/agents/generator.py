@@ -10,16 +10,17 @@ Output ONLY the final result.
 """
 
 def generate(plan: dict) -> str:
+    from google.genai import types
+
     response = client.models.generate_content(
         model=MODEL,
         contents=[
-            {"role": "system", "parts": [GENERATOR_SYSTEM_PROMPT]},
-            {"role": "user", "parts": [f"PLAN:\n{plan}"]},
+            {"role": "user", "parts": [{"text": f"{GENERATOR_SYSTEM_PROMPT}\n\nPLAN:\n{plan}"}]},
         ],
-        generation_config={
-            "temperature": 0.2,
-            "max_output_tokens": 1024,
-        },
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            maxOutputTokens=1024,
+        ),
     )
 
     return response.text

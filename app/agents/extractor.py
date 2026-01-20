@@ -25,16 +25,17 @@ Schema:
 """
 
 def extract_rules(chunk: str) -> dict:
+    from google.genai import types
+
     response = client.models.generate_content(
         model=MODEL,
         contents=[
-            {"role": "system", "parts": [EXTRACTOR_SYSTEM_PROMPT]},
-            {"role": "user", "parts": [f"DOCUMENT CHUNK:\n{chunk}"]},
+            {"role": "user", "parts": [{"text": f"{EXTRACTOR_SYSTEM_PROMPT}\n\nDOCUMENT CHUNK:\n{chunk}"}]},
         ],
-        generation_config={
-            "temperature": 0.0,
-            "max_output_tokens": 512,
-        },
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            maxOutputTokens=512,
+        ),
     )
 
     return json.loads(response.text)
