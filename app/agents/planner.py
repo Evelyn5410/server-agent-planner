@@ -23,6 +23,7 @@ Schema:
 
 def plan(user_input: str) -> dict:
     from google.genai import types
+    import re
 
     start = time.time()
 
@@ -39,7 +40,39 @@ def plan(user_input: str) -> dict:
 
     elapsed = time.time() - start
 
-    plan_json = json.loads(response.text)
+    raw_text = response.text
+
+    # Debug: log the raw response
+    print(f"[Planner] Raw response length: {len(raw_text) if raw_text else 0}")
+    print(f"[Planner] Raw response preview: {raw_text[:200] if raw_text else 'EMPTY'}...")
+
+    # Handle empty response
+    if not raw_text or not raw_text.strip():
+        print("[Planner] Warning: Empty response from LLM")
+        return {
+            "plan": {"task": user_input, "status": "rejected", "constraints": [], "assumptions": [], "output_requirements": []},
+            "latency_sec": round(elapsed, 3),
+            "usage": response.usage_metadata,
+            "error": "Empty LLM response"
+        }
+
+    # Strip markdown code blocks if present
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+
+    try:
+        plan_json = json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"[Planner] JSON parse error: {e}")
+        print(f"[Planner] Failed to parse: {text[:500]}")
+        return {
+            "plan": {"task": user_input, "status": "rejected", "constraints": [], "assumptions": [], "output_requirements": []},
+            "latency_sec": round(elapsed, 3),
+            "usage": response.usage_metadata,
+            "error": f"JSON parse error: {str(e)}"
+        }
 
     return {
         "plan": plan_json,
