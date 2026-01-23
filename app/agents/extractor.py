@@ -1,28 +1,6 @@
 import json
-from app.llm_client import client, MODEL
-
-EXTRACTOR_SYSTEM_PROMPT = """
-You are an EXTRACTION module.
-
-Extract explicit rules, constraints, requirements, or prohibitions.
-
-Rules:
-- Output ONLY valid JSON.
-- Do not summarize.
-- Do not explain.
-- If nothing is extractable, return an empty list.
-
-Schema:
-{
-  "extracted_rules": [
-    {
-      "type": "constraint | behavior | requirement | prohibition",
-      "statement": "string",
-      "confidence": "high | medium | low"
-    }
-  ]
-}
-"""
+from app.llm_client import client
+from app.constants import EXTRACTOR_SYSTEM_PROMPT, MODEL
 
 def extract_rules(chunk: str) -> dict:
     from google.genai import types

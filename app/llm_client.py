@@ -1,10 +1,12 @@
 import os
 import json
+from google import genai
+from google.cloud import secretmanager
 
 # Mock mode for local testing without GCP credentials
 MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
 
-MODEL = "gemini-2.5-flash-lite"
+from app.constants import MODEL  # Use centralized MODEL from constants
 
 
 class MockUsageMetadata(dict):
@@ -84,18 +86,23 @@ class MockClient:
     def __init__(self):
         self.models = MockModel()
 
+def get_secret(project_id: str, secret_id: str, version_id: str = "latest") -> str:
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
 
 if MOCK_LLM:
     print("[LLM Client] Running in MOCK mode - no GCP credentials required")
     client = MockClient()
 else:
-    from google import genai
 
     # Configuration from environment variables (set via GitHub secrets during deployment)
-    GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
+    GCP_PROJECT = "toolhub-web"
     GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
     # API key from Google Cloud Secret Manager "v_api_key" - accessed at runtime in Cloud Run
-    VERTEX_API_KEY = os.getenv("VERTEX_API_KEY")
+    # VERTEX_API_KEY = os.getenv("VERTEX_API_KEY")
+    VERTEX_API_KEY= get_secret(GCP_PROJECT, "v_api_key")
 
     if not GCP_PROJECT:
         raise RuntimeError("GCP_PROJECT_ID environment variable must be set")
@@ -116,3 +123,5 @@ else:
         project=GCP_PROJECT,
         location=GCP_LOCATION,
     )
+
+  

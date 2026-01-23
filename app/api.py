@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Body
 from app.executor import run, doc_to_plan
+from app.agents.raw_plan_handler import raw_plan_handler
 
 endpoint = FastAPI()
 
@@ -13,3 +14,8 @@ def plan(req: dict = Body(default={})):
     doc = req.get("doc", "")
     name = req.get("name", "demo-doc")
     return doc_to_plan(doc, name)
+
+@endpoint.post("/process-raw")
+def process_raw(req: dict = Body(default={})):
+    doc = req.get("doc", "")
+    return raw_plan_handler(doc)

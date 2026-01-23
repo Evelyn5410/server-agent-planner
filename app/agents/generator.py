@@ -1,13 +1,6 @@
 from app.llm_client import client, MODEL
+from app.constants import GENERATOR_SYSTEM_PROMPT
 
-GENERATOR_SYSTEM_PROMPT = """
-You are a GENERATION module in a controlled AI system.
-
-You must follow the provided PLAN exactly.
-You do NOT add new constraints.
-You do NOT explain your reasoning.
-Output ONLY the final result.
-"""
 
 def generate(plan: dict) -> str:
     from google.genai import types

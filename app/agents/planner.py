@@ -1,6 +1,8 @@
 import json
 import time
+import re
 from app.llm_client import client, MODEL
+from google.genai import types
 
 PLANNER_SYSTEM_PROMPT = """
 You are a PLANNING module in a controlled AI system.
@@ -22,8 +24,6 @@ Schema:
 
 
 def plan(user_input: str) -> dict:
-    from google.genai import types
-    import re
 
     start = time.time()
 

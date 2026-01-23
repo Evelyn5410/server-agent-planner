@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from app.agents import planner, generator, validator, merger, chunker, conflict_dealer, extractor, normalizer, assemble
 from app.store import save_artifact, save_plan
 
@@ -28,7 +29,6 @@ def run(user_input: str):
 def doc_to_plan(text, doc_id="demo-doc", version="v1"):
     if not text:
         # Read default fixture file
-        from pathlib import Path
         fixture_path = Path(__file__).parent / "fixture" / "apispec.txt"
         text = fixture_path.read_text()
     chunks = chunker.chunk_text(text)
@@ -46,3 +46,4 @@ def doc_to_plan(text, doc_id="demo-doc", version="v1"):
     save_plan(plan, f"{doc_id}_plan.json")
 
     return plan    
+
