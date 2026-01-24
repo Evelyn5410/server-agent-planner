@@ -14,6 +14,38 @@ from app.llm_client import client
 
 MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
 
+# JSON schema to enforce valid response structure
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rules": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "type": {"type": "string", "enum": ["obligation", "prohibition", "permission"]},
+                    "statement": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["low", "medium", "high"]}
+                },
+                "required": ["id", "type", "statement", "confidence"]
+            }
+        },
+        "open_questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rule_ids": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string"}
+                },
+                "required": ["rule_ids", "reason"]
+            }
+        }
+    },
+    "required": ["rules", "open_questions"]
+}
+
 
 def raw_plan_handler(document: str) -> dict:
     """
@@ -83,12 +115,15 @@ Document:
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     responseMimeType="application/json",
-                    maxOutputTokens=16384,
+                    responseJsonSchema=RESPONSE_SCHEMA,
+                    maxOutputTokens=32768,
                     httpOptions=types.HttpOptions(timeout=600_000),  # 10 min in ms
                 )
             )
 
             raw_text = response.text
+            print(f"[RawPlanHandler] Response length: {len(raw_text) if raw_text else 0}")
+
             if not raw_text:
                 raise RuntimeError("Empty response from LLM")
 
@@ -98,7 +133,9 @@ Document:
                 text = re.sub(r'^```(?:json)?\s*', '', text)
                 text = re.sub(r'\s*```$', '', text)
 
-            return json.loads(text)
+            result = json.loads(text)
+            print(f"[RawPlanHandler] Rules extracted: {len(result.get('rules', []))}")
+            return result
 
         except json.JSONDecodeError as e:
             last_error = f"JSON parse error: {e}"
