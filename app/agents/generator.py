@@ -11,8 +11,9 @@ def generate(plan: dict) -> str:
             {"role": "user", "parts": [{"text": f"{GENERATOR_SYSTEM_PROMPT}\n\nPLAN:\n{plan}"}]},
         ],
         config=types.GenerateContentConfig(
-            temperature=0.2,
-            maxOutputTokens=1024,
+            temperature=0.1,
+            max_output_tokens=1024,
+            response_mime_type="text/plain",
         ),
     )
 

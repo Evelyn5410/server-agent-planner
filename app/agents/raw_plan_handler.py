@@ -114,9 +114,9 @@ Document:
                 ],
                 config=types.GenerateContentConfig(
                     temperature=0.0,
-                    responseMimeType="application/json",
+                    response_mime_type="application/json",
                     responseJsonSchema=RESPONSE_SCHEMA,
-                    maxOutputTokens=32768,
+                    max_output_tokens=32768,
                     httpOptions=types.HttpOptions(timeout=600_000),  # 10 min in ms
                 )
             )
