@@ -13,7 +13,8 @@ def extract_rules(chunk: str) -> dict:
         ],
         config=types.GenerateContentConfig(
             temperature=0.0,
-            maxOutputTokens=512,
+            maxOutputTokens=2048,
+            responseMimeType="application/json",
         ),
     )
 
