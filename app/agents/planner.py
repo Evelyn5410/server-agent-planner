@@ -34,8 +34,8 @@ def plan(user_input: str) -> dict:
         ],
         config=types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=512,
-            response_mime_type="application/json",
+            maxOutputTokens=512,
+            responseMimeType="application/json",
         ),
     )
 

@@ -12,8 +12,8 @@ def generate(plan: dict) -> str:
         ],
         config=types.GenerateContentConfig(
             temperature=0.1,
-            max_output_tokens=1024,
-            response_mime_type="text/plain",
+            maxOutputTokens=1024,
+            responseMimeType="text/plain",
         ),
     )
 

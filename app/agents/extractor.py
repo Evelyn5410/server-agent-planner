@@ -5,102 +5,40 @@ from app.constants import EXTRACTOR_SYSTEM_PROMPT, MODEL
 def extract_rules(chunk: str) -> dict:
     from google.genai import types
     import re
-    import time
 
-    def repair_json(text: str) -> str:
-        """
-        Attempts to repair truncated JSON by closing open strings, arrays, and objects.
-        """
-        stack = []
-        in_string = False
-        escape = False
-        
-        # Iterate to find the point where valid JSON ends or truncation occurs
-        for char in text:
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == '\\':
-                    escape = True
-                elif char == '"':
-                    in_string = False
-            else:
-                if char == '"':
-                    in_string = True
-                elif char == '{':
-                    stack.append('}')
-                elif char == '[':
-                    stack.append(']')
-                elif char == '}' or char == ']':
-                    if stack and stack[-1] == char:
-                        stack.pop()
-                    else:
-                        # Mismatched closer - likely garbage or error. 
-                        # We could stop here, but simple repair is to just let it be 
-                        # and see if closing what we have helps, or return current text.
-                        # For now, let's just continue and assume maybe we missed an opener?
-                        # Or strictly, this is invalid.
-                        pass
-        
-        # Reconstruct
-        result = text
-        if in_string:
-            result += '"'
-        
-        if stack:
-            result += "".join(reversed(stack))
-            
-        return result
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            {"role": "user", "parts": [{"text": f"{EXTRACTOR_SYSTEM_PROMPT}\n\nDOCUMENT CHUNK:\n{chunk}"}]},
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            maxOutputTokens=2048,
+            responseMimeType="application/json",
+        ),
+    )
 
-    EXTRACTOR_SCHEMA = {
-        "type": "object",
-        "properties": {
-            "extracted_rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string", "enum": ["constraint", "behavior", "requirement", "prohibition"]},
-                        "statement": {"type": "string"},
-                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
-                    },
-                    "required": ["type", "statement", "confidence"]
-                }
-            }
-        },
-        "required": ["extracted_rules"]
-    }
+    try:
+        raw_text = response.text
+    except Exception as e:
+        print(f"[Extractor] Error accessing response.text: {e}")
+        return {"extracted_rules": []}
 
-    retries = 3
-    for attempt in range(retries):
-        try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=[
-                    {"role": "user", "parts": [{"text": f"{EXTRACTOR_SYSTEM_PROMPT}\n\nDOCUMENT CHUNK:\n{chunk}"}]},
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=8192,
-                    response_mime_type="application/json",
-                ),
-            )
+    # Debug: log the raw response
+    print(f"[Extractor] Raw response length: {len(raw_text) if raw_text else 0}")
+    print(f"[Extractor] Raw response preview: {raw_text[:200] if raw_text else 'EMPTY'}...")
 
-            try:
-                raw_text = response.text
-            except Exception as e:
-                print(f"[Extractor] Error accessing response.text: {e}")
-                continue
+    # Handle empty response
+    if not raw_text or not raw_text.strip():
+        print("[Extractor] Warning: Empty response from LLM")
+        return {"extracted_rules": []}
 
-            if not raw_text or not raw_text.strip():
-                print(f"[Extractor] Warning: Empty response from LLM (attempt {attempt+1})")
-                continue
-
-            # Strip markdown code blocks if present
-            text = raw_text.strip()
-            if text.startswith("```"):
-                text = re.sub(r'^```(?:json)?\s*', '', text)
-                text = re.sub(r'\s*```$', '', text)
+    # Strip markdown code blocks if present
+    text = raw_text.strip()
+    if text.startswith("```"):
+        # Remove ```json or ``` prefix and ``` suffix
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
 
             try:
                 return json.loads(text)
