@@ -52,6 +52,25 @@ def extract_rules(chunk: str) -> dict:
             
         return result
 
+    EXTRACTOR_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "extracted_rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["constraint", "behavior", "requirement", "prohibition"]},
+                        "statement": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                    },
+                    "required": ["type", "statement", "confidence"]
+                }
+            }
+        },
+        "required": ["extracted_rules"]
+    }
+
     retries = 3
     for attempt in range(retries):
         try:
@@ -64,6 +83,7 @@ def extract_rules(chunk: str) -> dict:
                     temperature=0.0,
                     max_output_tokens=8192,
                     response_mime_type="application/json",
+                    response_schema=EXTRACTOR_SCHEMA,
                 ),
             )
 

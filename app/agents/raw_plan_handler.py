@@ -8,9 +8,11 @@ No metrics tracking here - that's handled by the benchmark pipeline.
 import json
 import os
 import re
+import uuid
 from google.genai import types
 from app.constants import PLAN_SCHEMA, MODEL
 from app.llm_client import client
+from app.store import save_plan
 
 MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
 
@@ -115,9 +117,9 @@ Document:
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     response_mime_type="application/json",
-                    responseJsonSchema=RESPONSE_SCHEMA,
+                    response_schema=RESPONSE_SCHEMA,
                     max_output_tokens=32768,
-                    httpOptions=types.HttpOptions(timeout=600_000),  # 10 min in ms
+                    http_options=types.HttpOptions(timeout=600_000),  # 10 min in ms
                 )
             )
 
@@ -135,6 +137,10 @@ Document:
 
             result = json.loads(text)
             print(f"[RawPlanHandler] Rules extracted: {len(result.get('rules', []))}")
+            
+            # Save to store
+            save_plan(result, f"process-raw_{uuid.uuid4()}.json")
+            
             return result
 
         except json.JSONDecodeError as e:
