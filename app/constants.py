@@ -1,21 +1,32 @@
-PLAN_SCHEMA = """
-{
-  "rules": [
-    {
-      "id": "RULE-<number>",
-      "type": "obligation | prohibition | permission",
-      "statement": "string",
-      "confidence": "low | medium | high"
-    }
-  ],
-  "open_questions": [
-    {
-      "rule_ids": ["RULE-1", "RULE-2"],
-      "reason": "string"
-    }
-  ]
+RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC = {
+    "type": "object",
+    "properties": {
+        "extracted_rules": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["constraint", "behavior", "requirement", "prohibition"]},
+                    "statement": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                },
+                "required": ["type", "statement", "confidence"]
+            }
+        },
+        "open_questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rule_ids": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string"}
+                },
+                "required": ["rule_ids", "reason"]
+            }
+        }
+    },
+    "required": ["extracted_rules", "open_questions"]
 }
-"""
 
 EXTRACTOR_SYSTEM_PROMPT = """
 You are an EXTRACTION module.
@@ -39,6 +50,25 @@ Schema:
   ]
 }
 """
+
+EXTRACTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "extracted_rules": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["constraint", "behavior", "requirement", "prohibition"]},
+                    "statement": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                },
+                "required": ["type", "statement", "confidence"]
+            }
+        }
+    },
+    "required": ["extracted_rules"]
+}
 
 GENERATOR_SYSTEM_PROMPT = """
 You are a GENERATION module in a controlled AI system.

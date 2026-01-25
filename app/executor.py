@@ -1,30 +1,6 @@
-import uuid
 from pathlib import Path
-from app.agents import planner, generator, validator, merger, chunker, conflict_dealer, extractor, normalizer, assemble
-from app.store import save_artifact, save_plan
-
-MAX_RETRIES = 2
-
-def run(user_input: str):
-    run_id = str(uuid.uuid4())
-
-    plan = planner.plan(user_input)
-    save_artifact(run_id, "plan", plan)
-
-    for attempt in range(MAX_RETRIES):
-        output = generator.generate(plan)
-        save_artifact(run_id, f"output_{attempt}", {"output": output})
-
-        result = validator.validate(output, plan)
-        save_artifact(run_id, f"validation_{attempt}", result)
-
-        if result["valid"]:
-            return {"run_id": run_id, "output": output}
-
-        plan["feedback"] = result["issues"]
-
-    return {"run_id": run_id, "error": "Validation failed"}
-
+from app.agents import merger, chunker, conflict_dealer, extractor, normalizer, assemble
+from app.store import save_plan
 
 def doc_to_plan(text, doc_id="demo-doc", version="v1"):
     if not text:
@@ -34,16 +10,24 @@ def doc_to_plan(text, doc_id="demo-doc", version="v1"):
     chunks = chunker.chunk_text(text)
     extracted = []
 
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         result = extractor.extract_rules(chunk)
+        print(f"Extracted Rules: {result}")
         extracted.append(result["extracted_rules"])
+        print(index)
 
+    print("===============finished extracting==============")
     normalized = [normalizer.normalize_rule(r) for rules in extracted for r in rules]
+    print("==================rule normalized=================")
     merged = merger.merge_rules([normalized])
+    print("================rule merged=====================")
     conflicts = conflict_dealer.detect_conflicts(merged)
-
+    print("================conflict resolved================")
     plan = assemble.build_plan(doc_id, version, merged, conflicts)
     save_plan(plan, f"{doc_id}_plan.json")
-
+    print("===============plan saved===================")
     return plan    
+
+if __name__ == "__main__":
+    doc_to_plan(None)
 
