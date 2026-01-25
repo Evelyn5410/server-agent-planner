@@ -83,7 +83,6 @@ def extract_rules(chunk: str) -> dict:
                     temperature=0.0,
                     max_output_tokens=8192,
                     response_mime_type="application/json",
-                    response_schema=EXTRACTOR_SCHEMA,
                 ),
             )
 
