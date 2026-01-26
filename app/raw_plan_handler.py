@@ -45,7 +45,7 @@ Rules:
 
 Schema:
 {{
-  "extracted_rules": [
+  "rules": [
     {{
       "type": "constraint | behavior | requirement | prohibition",
       "statement": "string",
@@ -73,30 +73,22 @@ Document:
                     temperature=0.0,
                     response_mime_type="application/json",
                     response_schema=RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC,
-                    max_output_tokens=32768,
+                    max_output_tokens=65536,
                     http_options=types.HttpOptions(timeout=600_000),
                 ),
             )
 
             raw_text = ""
+            finish_reason = None
             for chunk in response_stream:
                 if chunk.text:
                     raw_text += chunk.text
-            
-            # Check finish reason from the last chunk/response
-            # Note: In stream, usage_metadata and finish_reason are usually on the last chunk
-            # We can inspect the accumulated response object if needed, but iteration is simplest.
-            print(f"[RawPlanHandler] Response length: {len(raw_text)}")
-            
-            # Try to log finish reason if possible (implementation specific)
-            try:
-                # Iterate through candidates of the LAST chunk if accessible, 
-                # or rely on the loop finishing. 
-                # Printing the last chunk's finish reason:
                 if chunk.candidates and chunk.candidates[0].finish_reason:
-                     print(f"[RawPlanHandler] Finish Reason: {chunk.candidates[0].finish_reason}")
-            except:
-                pass
+                    finish_reason = chunk.candidates[0].finish_reason
+            
+            print(f"[RawPlanHandler] Response length: {len(raw_text)}")
+            if finish_reason:
+                 print(f"[RawPlanHandler] Finish Reason: {finish_reason}")
 
             if not raw_text:
                 raise RuntimeError("Empty response from LLM")
@@ -107,28 +99,39 @@ Document:
                 text = re.sub(r'^```(?:json)?\s*', '', text)
                 text = re.sub(r'\s*```$', '', text)
 
-            result = json.loads(text)
-            print(f"[RawPlanHandler] Rules extracted: {len(result.get('extracted_rules', []))}")
+            result = {"rules": [], "open_questions": []}
+            is_truncated = (finish_reason == "MAX_TOKENS") or (finish_reason == 2) # 2 is MAX_TOKENS in some enums
+
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError as e:
+                print(f"[RawPlanHandler] JSON parse error: {e}. Attempting repair.")
+                try:
+                    repaired = repair_json(text)
+                    result = json.loads(repaired)
+                    print(f"[RawPlanHandler] Repaired JSON. Rules: {len(result.get('rules', []))}")
+                    result["warning"] = "Response was truncated and repaired."
+                except Exception as repair_err:
+                    print(f"[RawPlanHandler] Repair failed: {repair_err}")
+                    result["error"] = f"JSON parse failed: {e}"
+            
+            if is_truncated:
+                result["finish_reason"] = "MAX_TOKENS"
+                print("[RawPlanHandler] WARNING: Token limit exceeded.")
+
+            # Ensure rules key exists
+            if "rules" not in result:
+                result["rules"] = []
+            
+            print(f"[RawPlanHandler] Rules extracted: {len(result.get('rules', []))}")
             save_plan(result, f"{doc_id}_plan.json")
             return result
 
-        except json.JSONDecodeError as e:
-            print(f"[RawPlanHandler] Attempt {attempt + 1} JSON parse error: {e}. Attempting repair.")
-            try:
-                repaired = repair_json(text)
-                print(f"[RawPlanHandler] Repaired JSON (tail): {repaired[-50:]}")
-                result = json.loads(repaired)
-                print(f"[RawPlanHandler] Rules extracted (repaired): {len(result.get('extracted_rules', []))}")
-                save_plan(result, f"{doc_id}_plan.json")
-                return result
-            except Exception as repair_err:
-                last_error = f"Repair failed: {repair_err}"
-                print(f"[RawPlanHandler] Attempt {attempt + 1}: {last_error}")
         except Exception as e:
             last_error = str(e)
-            print(f"[RawPlanHandler] Attempt {attempt + 1}: {last_error}")
+            print(f"[RawPlanHandler] Attempt {attempt + 1} failed: {last_error}")
 
-    return {"extracted_rules": [], "open_questions": [], "error": f"Failed after {max_retries} attempts: {last_error}"}
+    return {"rules": [], "open_questions": [], "error": f"Failed after {max_retries} attempts: {last_error}"}
 
 
 if __name__ == "__main__":

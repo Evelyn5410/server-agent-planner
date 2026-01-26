@@ -1,7 +1,7 @@
 RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC = {
     "type": "object",
     "properties": {
-        "extracted_rules": {
+        "rules": {
             "type": "array",
             "items": {
                 "type": "object",
@@ -25,7 +25,7 @@ RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC = {
             }
         }
     },
-    "required": ["extracted_rules", "open_questions"]
+    "required": ["rules", "open_questions"]
 }
 
 EXTRACTOR_SYSTEM_PROMPT = """
