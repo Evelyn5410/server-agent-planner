@@ -63,7 +63,8 @@ Document:
 
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
+            # Use streaming to handle long responses better and debug truncation
+            response_stream = client.models.generate_content_stream(
                 model=MODEL,
                 contents=[
                     {"role": "user", "parts": [{"text": prompt}]}
@@ -72,13 +73,30 @@ Document:
                     temperature=0.0,
                     response_mime_type="application/json",
                     response_schema=RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC,
-                    max_output_tokens=16384,
-                    http_options=types.HttpOptions(timeout=600_000),  # 10 min in ms
-                )
+                    max_output_tokens=32768,
+                    http_options=types.HttpOptions(timeout=600_000),
+                ),
             )
 
-            raw_text = response.text
-            print(f"[RawPlanHandler] Response length: {len(raw_text) if raw_text else 0}")
+            raw_text = ""
+            for chunk in response_stream:
+                if chunk.text:
+                    raw_text += chunk.text
+            
+            # Check finish reason from the last chunk/response
+            # Note: In stream, usage_metadata and finish_reason are usually on the last chunk
+            # We can inspect the accumulated response object if needed, but iteration is simplest.
+            print(f"[RawPlanHandler] Response length: {len(raw_text)}")
+            
+            # Try to log finish reason if possible (implementation specific)
+            try:
+                # Iterate through candidates of the LAST chunk if accessible, 
+                # or rely on the loop finishing. 
+                # Printing the last chunk's finish reason:
+                if chunk.candidates and chunk.candidates[0].finish_reason:
+                     print(f"[RawPlanHandler] Finish Reason: {chunk.candidates[0].finish_reason}")
+            except:
+                pass
 
             if not raw_text:
                 raise RuntimeError("Empty response from LLM")
