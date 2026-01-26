@@ -31,8 +31,20 @@ def repair_json(text: str) -> str:
     
     # Reconstruct
     result = text
+    
+    # Fix trailing structure before closing
+    stripped = result.rstrip()
     if in_string:
         result += '"'
+    elif stripped.endswith(":"):
+        result += 'null' # Provide dummy value
+    elif stripped.endswith(","):
+        # Remove trailing comma if valid JSON allows (standard JSON doesn't, but python json usually strict)
+        # Better to remove it.
+        # But we need to modify 'result', which is 'text'.
+        # Find last comma and remove it? 
+        # text.rstrip() might be safer.
+        result = stripped[:-1]
     
     if stack:
         result += "".join(reversed(stack))

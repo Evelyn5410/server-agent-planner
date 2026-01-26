@@ -1,8 +1,10 @@
+import uuid
 from pathlib import Path
 from app.agents import merger, chunker, conflict_dealer, extractor, normalizer, assemble
 from app.store import save_plan
 
-def doc_to_plan(text, doc_id="demo-doc", version="v1"):
+def doc_to_plan(text, version="v1"):
+    doc_id = str(uuid.uuid4())[:8]
     if not text:
         # Read default fixture file
         fixture_path = Path(__file__).parent / "fixture" / "apispec.txt"

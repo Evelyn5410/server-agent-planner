@@ -8,7 +8,7 @@ endpoint = FastAPI()
 def plan(req: dict = Body(default={})):
     doc = req.get("doc", "")
     name = req.get("name", "demo-doc")
-    return doc_to_plan(doc, name)
+    return doc_to_plan(doc)
 
 @endpoint.post("/process-raw")
 def process_raw(req: dict = Body(default={})):

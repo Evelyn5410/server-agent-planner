@@ -13,7 +13,7 @@ from app.constants import MODEL
 from app.llm_client import client
 from app.store import save_plan
 from app.util.json_repair import repair_json
-from constants import RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC
+from app.constants import RESPONSE_SCHEMA_FOR_PROCESS_RAW_DOC
 
 def raw_plan_handler(document: str) -> dict:
     """
